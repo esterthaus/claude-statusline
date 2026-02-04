@@ -1,0 +1,130 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          # Windows
+          - os: windows
+            arch: amd64
+            ext: .exe
+          - os: windows
+            arch: arm64
+            ext: .exe
+          # Linux
+          - os: linux
+            arch: amd64
+            ext: ""
+          - os: linux
+            arch: arm64
+            ext: ""
+          # macOS
+          - os: darwin
+            arch: amd64
+            ext: ""
+          - os: darwin
+            arch: arm64
+            ext: ""
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          go build -ldflags="-s -w" -o claude-statusline-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }} .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-statusline-${{ matrix.os }}-${{ matrix.arch }}
+          path: claude-statusline-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: Claude Statusline ${{ steps.version.outputs.version }}
+          body: |
+            ## Claude Code Statusline ${{ steps.version.outputs.version }}
+
+            Cross-platform statusline for Claude Code CLI.
+
+            ### Features
+            - Model name and context window progress
+            - 5h and 7d usage limits with reset times
+            - Git status (changes, staged, stash, unpushed/unpulled)
+            - CPU and RAM utilization
+            - Session duration tracking
+
+            ### Installation
+            1. Download the binary for your platform
+            2. Place it in `~/.claude/` (rename to `claude-statusline.exe` on Windows or `claude-statusline` on Linux/macOS)
+            3. Add to `~/.claude/settings.json`:
+            ```json
+            {
+              "statusLine": {
+                "type": "command",
+                "command": "/path/to/claude-statusline"
+              }
+            }
+            ```
+
+            ### Binaries
+            - **Windows**: `claude-statusline-windows-amd64.exe` / `claude-statusline-windows-arm64.exe`
+            - **Linux**: `claude-statusline-linux-amd64` / `claude-statusline-linux-arm64`
+            - **macOS**: `claude-statusline-darwin-amd64` / `claude-statusline-darwin-arm64`
+          draft: false
+          prerelease: false
+          files: release/*

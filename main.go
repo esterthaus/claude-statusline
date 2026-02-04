@@ -13,6 +13,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/mem"
 )
 
 // ANSI Farben
@@ -43,6 +46,9 @@ const (
 	IconCalendar = "📅"
 	IconFolder   = "📂"
 	IconGit      = "⎇"
+	IconCPU      = "💻"
+	IconRAM      = "🎛"
+	IconSession  = "⏳"
 )
 
 // API Konfiguration
@@ -185,6 +191,10 @@ func main() {
 		line1 += Dim + IconCalendar + " 7d: N/A" + Reset
 	}
 
+	// System Stats holen
+	cpuPercent, memPercent := getSystemStats()
+	sessionDur := getSessionDuration()
+
 	// Zeile 2: CWD + Git Status
 	line2 := fmt.Sprintf("%s %s%s%s  %s•%s  %s %s",
 		IconFolder, Cyan, cwd, Reset,
@@ -192,8 +202,33 @@ func main() {
 		IconGit, gitStatus,
 	)
 
+	// Zeile 3: System Stats + Session
+	line3 := fmt.Sprintf("%s CPU: %s %s%.0f%%%s",
+		IconCPU, renderMiniBar(cpuPercent, 8),
+		getColorForPercentage(int(cpuPercent)), cpuPercent, Reset,
+	)
+	line3 += fmt.Sprintf("  %s•%s  %s RAM: %s %s%.0f%%%s",
+		Dim, Reset,
+		IconRAM, renderMiniBar(memPercent, 8),
+		getColorForPercentage(int(memPercent)), memPercent, Reset,
+	)
+
+	// Session-Dauer
+	if sessionDur > 0 {
+		line3 += fmt.Sprintf("  %s•%s  %s Session: %s%s%s",
+			Dim, Reset,
+			IconSession, BrightCyan, formatSessionDuration(sessionDur), Reset,
+		)
+	} else {
+		line3 += fmt.Sprintf("  %s•%s  %s Session: %s<1m%s",
+			Dim, Reset,
+			IconSession, Dim, Reset,
+		)
+	}
+
 	fmt.Println(line1)
 	fmt.Println(line2)
+	fmt.Println(line3)
 }
 
 // getUsageLimits holt Usage-Daten von der API (mit Caching)
@@ -573,4 +608,67 @@ func resolveWorkDir(cwd string) string {
 	}
 
 	return cwd
+}
+
+// getSystemStats holt CPU und RAM Auslastung
+func getSystemStats() (cpuPercent float64, memPercent float64) {
+	// CPU Auslastung (kurzes Intervall für schnelle Antwort)
+	cpuPercentages, err := cpu.Percent(100*time.Millisecond, false)
+	if err == nil && len(cpuPercentages) > 0 {
+		cpuPercent = cpuPercentages[0]
+	}
+
+	// RAM Auslastung
+	memInfo, err := mem.VirtualMemory()
+	if err == nil {
+		memPercent = memInfo.UsedPercent
+	}
+
+	return
+}
+
+// getSessionDuration holt die Session-Dauer
+func getSessionDuration() time.Duration {
+	sessionFile := filepath.Join(getClaudeDir(), "cache", "session_start.txt")
+
+	// Versuche Session-Start zu lesen
+	data, err := os.ReadFile(sessionFile)
+	if err != nil {
+		// Erste Ausführung - speichere aktuelle Zeit
+		os.MkdirAll(filepath.Dir(sessionFile), 0755)
+		os.WriteFile(sessionFile, []byte(fmt.Sprintf("%d", time.Now().Unix())), 0644)
+		return 0
+	}
+
+	startTime, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0
+	}
+
+	return time.Since(time.Unix(startTime, 0))
+}
+
+// formatSessionDuration formatiert die Session-Dauer kompakt
+func formatSessionDuration(d time.Duration) string {
+	d = d.Round(time.Minute)
+
+	hours := int(d.Hours())
+	minutes := int(d.Minutes()) % 60
+
+	if hours > 0 {
+		return fmt.Sprintf("%dh%dm", hours, minutes)
+	}
+	return fmt.Sprintf("%dm", minutes)
+}
+
+// renderMiniBar rendert eine kompakte Progress-Bar
+func renderMiniBar(percent float64, width int) string {
+	filled := int(percent * float64(width) / 100)
+	if filled > width {
+		filled = width
+	}
+	empty := width - filled
+
+	color := getColorForPercentage(int(percent))
+	return fmt.Sprintf("%s%s%s%s", color, strings.Repeat("█", filled), strings.Repeat("░", empty), Reset)
 }
