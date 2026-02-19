@@ -16,6 +16,7 @@ import (
 
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
+	"github.com/shirou/gopsutil/v3/process"
 )
 
 // ANSI Farben
@@ -627,25 +628,38 @@ func getSystemStats() (cpuPercent float64, memPercent float64) {
 	return
 }
 
-// getSessionDuration holt die Session-Dauer
+// getSessionDuration ermittelt die Session-Dauer anhand der CreateTime des CC-Prozesses
 func getSessionDuration() time.Duration {
-	sessionFile := filepath.Join(getClaudeDir(), "cache", "session_start.txt")
-
-	// Versuche Session-Start zu lesen
-	data, err := os.ReadFile(sessionFile)
-	if err != nil {
-		// Erste Ausführung - speichere aktuelle Zeit
-		os.MkdirAll(filepath.Dir(sessionFile), 0755)
-		os.WriteFile(sessionFile, []byte(fmt.Sprintf("%d", time.Now().Unix())), 0644)
-		return 0
-	}
-
-	startTime, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	ppid := int32(os.Getppid())
+	proc, err := process.NewProcess(ppid)
 	if err != nil {
 		return 0
 	}
 
-	return time.Since(time.Unix(startTime, 0))
+	createTime, err := proc.CreateTime() // Millisekunden seit Epoch
+	if err != nil {
+		return 0
+	}
+
+	// Wenn Parent erst kürzlich erstellt (<2s), ist es ein Shell-Wrapper
+	// → zum Grandparent (CC-Prozess) hochgehen
+	if time.Now().UnixMilli()-createTime < 2000 {
+		gppid, err := proc.Ppid()
+		if err != nil {
+			return time.Since(time.UnixMilli(createTime))
+		}
+		gproc, err := process.NewProcess(gppid)
+		if err != nil {
+			return time.Since(time.UnixMilli(createTime))
+		}
+		gCreateTime, err := gproc.CreateTime()
+		if err != nil {
+			return time.Since(time.UnixMilli(createTime))
+		}
+		return time.Since(time.UnixMilli(gCreateTime))
+	}
+
+	return time.Since(time.UnixMilli(createTime))
 }
 
 // formatSessionDuration formatiert die Session-Dauer kompakt
