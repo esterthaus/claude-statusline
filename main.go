@@ -56,6 +56,7 @@ const (
 const (
 	APIEndpoint   = "https://api.anthropic.com/api/oauth/usage"
 	AnthropicBeta = "oauth-2025-04-20"
+	UserAgent     = "claude-code/2.1.70"
 	CacheDuration = 60 // Sekunden
 )
 
@@ -234,6 +235,11 @@ func main() {
 
 // getUsageLimits holt Usage-Daten von der API (mit Caching)
 func getUsageLimits() UsageData {
+	// Off-Switch: STATUSLINE_DISABLE_USAGE=1 deaktiviert den API-Aufruf komplett
+	if os.Getenv("STATUSLINE_DISABLE_USAGE") == "1" {
+		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}
+	}
+
 	cacheFile := filepath.Join(getClaudeDir(), "cache", "usage_persist_cache.txt")
 
 	// Cache prüfen
@@ -244,8 +250,10 @@ func getUsageLimits() UsageData {
 	// API aufrufen
 	usage := fetchUsageFromAPI()
 
-	// Cache speichern
-	saveCache(cacheFile, usage)
+	// Nur erfolgreiche Responses cachen (nicht -1/Fehler)
+	if usage.FiveHourUtil >= 0 || usage.SevenDayUtil >= 0 {
+		saveCache(cacheFile, usage)
+	}
 
 	return usage
 }
@@ -316,14 +324,15 @@ func fetchUsageFromAPI() UsageData {
 		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}
 	}
 
-	client := &http.Client{Timeout: 2 * time.Second}
+	client := &http.Client{Timeout: 5 * time.Second}
 
 	req, err := http.NewRequest("GET", APIEndpoint, nil)
 	if err != nil {
 		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}
 	}
 
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("anthropic-beta", AnthropicBeta)
 

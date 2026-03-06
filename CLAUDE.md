@@ -38,7 +38,7 @@ stdin JSON → parse StatusLineInput → fetch external data in parallel → ren
 
 | Source | Function | Notes |
 |--------|----------|-------|
-| Anthropic OAuth API | `fetchUsageFromAPI()` | 2s timeout, 60s file-based cache in `~/.claude/cache/usage_persist_cache.txt` |
+| Anthropic OAuth API | `fetchUsageFromAPI()` | 5s timeout, 60s file-based cache in `~/.claude/cache/usage_persist_cache.txt`, failed responses are never cached |
 | `~/.claude/.credentials.json` | `getAccessToken()` | OAuth token for API calls |
 | Git CLI commands | `getGitStatus()` | Uses `--no-optional-locks` and `core.useBuiltinFSMonitor=false` flags |
 | gopsutil library | `getSystemStats()` | CPU (100ms sample) and RAM percentage |
@@ -83,6 +83,12 @@ On Windows with Git Bash / MSYS2, the command path **must** use forward slashes 
 ```
 
 `make install` copies the binary to `~/.claude/` which resolves correctly on all platforms.
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STATUSLINE_DISABLE_USAGE` | *(unset)* | Set to `1` to disable the Anthropic usage API call entirely. Usage limits show "N/A". |
 
 ## Release
 
