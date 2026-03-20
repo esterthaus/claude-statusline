@@ -4,8 +4,6 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -50,14 +48,8 @@ const (
 	IconCPU      = "💻"
 	IconRAM      = "🎛"
 	IconSession  = "⏳"
-)
-
-// API Konfiguration
-const (
-	APIEndpoint   = "https://api.anthropic.com/api/oauth/usage"
-	AnthropicBeta = "oauth-2025-04-20"
-	UserAgent     = "claude-code/2.1.70"
-	CacheDuration = 60 // Sekunden
+	IconCost     = "💰"
+	IconWorktree = "🌿"
 )
 
 // Input JSON Struktur (von Claude Code)
@@ -68,42 +60,62 @@ type StatusLineInput struct {
 			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 		} `json:"current_usage"`
-		ContextWindowSize int `json:"context_window_size"`
+		TotalInputTokens    int  `json:"total_input_tokens"`
+		TotalOutputTokens   int  `json:"total_output_tokens"`
+		ContextWindowSize   int  `json:"context_window_size"`
+		UsedPercentage      *float64 `json:"used_percentage"`
+		RemainingPercentage *float64 `json:"remaining_percentage"`
 	} `json:"context_window"`
 	Model struct {
+		ID          string `json:"id"`
 		DisplayName string `json:"display_name"`
 	} `json:"model"`
 	Workspace struct {
 		CurrentDir string `json:"current_dir"`
+		ProjectDir string `json:"project_dir"`
 	} `json:"workspace"`
-	Cwd string `json:"cwd"`
+	Cost *struct {
+		TotalCostUSD       float64 `json:"total_cost_usd"`
+		TotalDurationMs    int64   `json:"total_duration_ms"`
+		TotalAPIDurationMs int64   `json:"total_api_duration_ms"`
+		TotalLinesAdded    int     `json:"total_lines_added"`
+		TotalLinesRemoved  int     `json:"total_lines_removed"`
+	} `json:"cost"`
+	Worktree *struct {
+		Name           string `json:"name"`
+		Path           string `json:"path"`
+		Branch         string `json:"branch"`
+		OriginalCwd    string `json:"original_cwd"`
+		OriginalBranch string `json:"original_branch"`
+	} `json:"worktree"`
+	Vim *struct {
+		Mode string `json:"mode"`
+	} `json:"vim"`
+	Agent *struct {
+		Name string `json:"name"`
+	} `json:"agent"`
+	RateLimits *struct {
+		FiveHour *struct {
+			UsedPercentage float64 `json:"used_percentage"`
+			ResetsAt       float64 `json:"resets_at"`
+		} `json:"five_hour"`
+		SevenDay *struct {
+			UsedPercentage float64 `json:"used_percentage"`
+			ResetsAt       float64 `json:"resets_at"`
+		} `json:"seven_day"`
+	} `json:"rate_limits"`
+	Version           string `json:"version"`
+	SessionID         string `json:"session_id"`
+	Cwd               string `json:"cwd"`
+	Exceeds200kTokens bool   `json:"exceeds_200k_tokens"`
 }
 
-// Credentials JSON Struktur
-type Credentials struct {
-	ClaudeAiOauth struct {
-		AccessToken string `json:"accessToken"`
-	} `json:"claudeAiOauth"`
-}
-
-// Usage API Response
-type UsageResponse struct {
-	FiveHour struct {
-		Utilization float64 `json:"utilization"`
-		ResetsAt    string  `json:"resets_at"`
-	} `json:"five_hour"`
-	SevenDay struct {
-		Utilization float64 `json:"utilization"`
-		ResetsAt    string  `json:"resets_at"`
-	} `json:"seven_day"`
-}
-
-// UsageData gecachte Daten
+// UsageData fuer Rate-Limit-Anzeige
 type UsageData struct {
 	FiveHourUtil   int
 	SevenDayUtil   int
-	FiveHourReset  string
-	SevenDayReset  string
+	FiveHourReset  int64
+	SevenDayReset  int64
 }
 
 func main() {
@@ -141,19 +153,39 @@ func main() {
 	}
 	cwd = shortenPath(cwd)
 
-	// Context Window berechnen
+	// Context Window: native used_percentage nutzen, Fallback auf manuelle Berechnung
 	var currentTokens int
 	contextSize := input.ContextWindow.ContextWindowSize
 	if contextSize == 0 {
 		contextSize = 200000
 	}
-	if input.ContextWindow.CurrentUsage != nil {
+
+	if input.ContextWindow.UsedPercentage != nil {
+		currentTokens = int(*input.ContextWindow.UsedPercentage) * contextSize / 100
+	} else if input.ContextWindow.CurrentUsage != nil {
 		cu := input.ContextWindow.CurrentUsage
 		currentTokens = cu.InputTokens + cu.CacheCreationInputTokens + cu.CacheReadInputTokens
 	}
 
-	// Usage Limits holen (mit Caching)
-	usage := getUsageLimits()
+	// Usage Limits aus stdin-JSON (nativ von Claude Code)
+	var usage UsageData
+	if input.RateLimits != nil {
+		if input.RateLimits.FiveHour != nil {
+			usage.FiveHourUtil = int(input.RateLimits.FiveHour.UsedPercentage)
+			usage.FiveHourReset = int64(input.RateLimits.FiveHour.ResetsAt)
+		} else {
+			usage.FiveHourUtil = -1
+		}
+		if input.RateLimits.SevenDay != nil {
+			usage.SevenDayUtil = int(input.RateLimits.SevenDay.UsedPercentage)
+			usage.SevenDayReset = int64(input.RateLimits.SevenDay.ResetsAt)
+		} else {
+			usage.SevenDayUtil = -1
+		}
+	} else {
+		usage.FiveHourUtil = -1
+		usage.SevenDayUtil = -1
+	}
 
 	// Git Status holen
 	gitStatus := getGitStatus(cwd)
@@ -170,8 +202,8 @@ func main() {
 	line1 += fmt.Sprintf("  %s•%s  ", Dim, Reset)
 	if usage.FiveHourUtil >= 0 {
 		line1 += renderProgressBar(usage.FiveHourUtil, 100, IconClock+" 5h", 12, BrightMagenta)
-		if usage.FiveHourReset != "" && usage.FiveHourReset != "N/A" {
-			resetTime, _ := time.Parse(time.RFC3339, usage.FiveHourReset)
+		if usage.FiveHourReset > 0 {
+			resetTime := time.Unix(usage.FiveHourReset, 0)
 			timeUntil := time.Until(resetTime)
 			if timeUntil > 0 {
 				line1 += fmt.Sprintf(" %sin %s (%s)%s", Dim, formatDuration(timeUntil), resetTime.Local().Format("15:04"), Reset)
@@ -185,8 +217,8 @@ func main() {
 	line1 += fmt.Sprintf("  %s•%s  ", Dim, Reset)
 	if usage.SevenDayUtil >= 0 {
 		line1 += renderProgressBar(usage.SevenDayUtil, 100, IconCalendar+" 7d", 12, BrightYellow)
-		if usage.SevenDayReset != "" && usage.SevenDayReset != "N/A" {
-			resetTime, _ := time.Parse(time.RFC3339, usage.SevenDayReset)
+		if usage.SevenDayReset > 0 {
+			resetTime := time.Unix(usage.SevenDayReset, 0)
 			line1 += fmt.Sprintf(" %s%s%s", Dim, resetTime.Local().Format("02. Jan 15:04"), Reset)
 		}
 	} else {
@@ -197,12 +229,19 @@ func main() {
 	cpuPercent, memPercent := getSystemStats()
 	sessionDur := getSessionDuration()
 
-	// Zeile 2: CWD + Git Status
+	// Zeile 2: CWD + Git Status + Worktree
 	line2 := fmt.Sprintf("%s %s%s%s  %s•%s  %s %s",
 		IconFolder, Cyan, cwd, Reset,
 		Dim, Reset,
 		IconGit, gitStatus,
 	)
+
+	if input.Worktree != nil && input.Worktree.Name != "" {
+		line2 += fmt.Sprintf("  %s•%s  %s %s%s%s",
+			Dim, Reset,
+			IconWorktree, BrightGreen, input.Worktree.Name, Reset,
+		)
+	}
 
 	// Zeile 3: System Stats + Session
 	line3 := fmt.Sprintf("%s CPU: %s %s%.0f%%%s",
@@ -228,164 +267,19 @@ func main() {
 		)
 	}
 
+	// Kosten (nur anzeigen wenn vorhanden)
+	if input.Cost != nil && input.Cost.TotalCostUSD > 0 {
+		line3 += fmt.Sprintf("  %s•%s  %s %s$%.2f%s",
+			Dim, Reset,
+			IconCost, BrightYellow, input.Cost.TotalCostUSD, Reset,
+		)
+	}
+
 	fmt.Println(line1)
 	fmt.Println(line2)
 	fmt.Println(line3)
 }
 
-// getUsageLimits holt Usage-Daten von der API (mit Caching)
-func getUsageLimits() UsageData {
-	// Off-Switch: STATUSLINE_DISABLE_USAGE=1 deaktiviert den API-Aufruf komplett
-	if os.Getenv("STATUSLINE_DISABLE_USAGE") == "1" {
-		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}
-	}
-
-	cacheFile := filepath.Join(getClaudeDir(), "cache", "usage_persist_cache.txt")
-
-	// Cache prüfen
-	if cached, ok := readCache(cacheFile); ok {
-		return cached
-	}
-
-	// API aufrufen
-	usage := fetchUsageFromAPI()
-
-	// Nur erfolgreiche Responses cachen (nicht -1/Fehler)
-	if usage.FiveHourUtil >= 0 || usage.SevenDayUtil >= 0 {
-		saveCache(cacheFile, usage)
-	}
-
-	return usage
-}
-
-// readCache liest gecachte Usage-Daten
-func readCache(cacheFile string) (UsageData, bool) {
-	data, err := os.ReadFile(cacheFile)
-	if err != nil {
-		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}, false
-	}
-
-	lines := strings.Split(string(data), "\n")
-	if len(lines) < 2 {
-		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}, false
-	}
-
-	timestamp, err := strconv.ParseInt(strings.TrimSpace(lines[0]), 10, 64)
-	if err != nil {
-		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}, false
-	}
-
-	// Cache zu alt?
-	if time.Now().Unix()-timestamp > CacheDuration {
-		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}, false
-	}
-
-	// Parse cached data: util:100:util:100|reset_5h|reset_weekly
-	cached := strings.TrimSpace(lines[1])
-	parts := strings.Split(cached, "|")
-	if len(parts) < 3 {
-		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}, false
-	}
-
-	numbers := strings.Split(parts[0], ":")
-	if len(numbers) < 4 {
-		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}, false
-	}
-
-	fiveHour, _ := strconv.Atoi(numbers[0])
-	sevenDay, _ := strconv.Atoi(numbers[2])
-
-	return UsageData{
-		FiveHourUtil:  fiveHour,
-		SevenDayUtil:  sevenDay,
-		FiveHourReset: parts[1],
-		SevenDayReset: parts[2],
-	}, true
-}
-
-// saveCache speichert Usage-Daten im Cache
-func saveCache(cacheFile string, usage UsageData) {
-	// Sicherstellen dass das Verzeichnis existiert
-	os.MkdirAll(filepath.Dir(cacheFile), 0755)
-
-	content := fmt.Sprintf("%d\n%d:100:%d:100|%s|%s",
-		time.Now().Unix(),
-		usage.FiveHourUtil, usage.SevenDayUtil,
-		usage.FiveHourReset, usage.SevenDayReset,
-	)
-
-	os.WriteFile(cacheFile, []byte(content), 0644)
-}
-
-// fetchUsageFromAPI holt Usage-Daten von der Anthropic API
-func fetchUsageFromAPI() UsageData {
-	token := getAccessToken()
-	if token == "" {
-		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}
-	}
-
-	client := &http.Client{Timeout: 5 * time.Second}
-
-	req, err := http.NewRequest("GET", APIEndpoint, nil)
-	if err != nil {
-		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", UserAgent)
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("anthropic-beta", AnthropicBeta)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}
-	}
-
-	var usageResp UsageResponse
-	if err := json.Unmarshal(body, &usageResp); err != nil {
-		return UsageData{FiveHourUtil: -1, SevenDayUtil: -1}
-	}
-
-	return UsageData{
-		FiveHourUtil:  int(usageResp.FiveHour.Utilization),
-		SevenDayUtil:  int(usageResp.SevenDay.Utilization),
-		FiveHourReset: usageResp.FiveHour.ResetsAt,
-		SevenDayReset: usageResp.SevenDay.ResetsAt,
-	}
-}
-
-// getAccessToken liest den Access Token aus den Credentials
-func getAccessToken() string {
-	credsFile := filepath.Join(getClaudeDir(), ".credentials.json")
-
-	data, err := os.ReadFile(credsFile)
-	if err != nil {
-		return ""
-	}
-
-	var creds Credentials
-	if err := json.Unmarshal(data, &creds); err != nil {
-		return ""
-	}
-
-	return creds.ClaudeAiOauth.AccessToken
-}
-
-// getClaudeDir gibt das Claude-Konfigurationsverzeichnis zurück
-func getClaudeDir() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".claude")
-}
 
 // formatDuration formatiert eine Dauer als "2h 30m"
 func formatDuration(d time.Duration) string {

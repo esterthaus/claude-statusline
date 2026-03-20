@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Cross-platform CLI statusline renderer for Claude Code. Single Go binary that reads JSON from stdin (provided by Claude Code CLI) and outputs 3 ANSI-colored lines to stdout showing model info, context usage, API usage limits, git status, system stats, and session duration.
+Cross-platform CLI statusline renderer for Claude Code. Single Go binary that reads JSON from stdin (provided by Claude Code CLI) and outputs 3 ANSI-colored lines to stdout showing model info, context usage, rate limits, git status, system stats, session duration, and cost.
 
 ## Build & Run Commands
 
@@ -20,7 +20,7 @@ Build uses `go build -ldflags="-s -w"` for stripped, size-optimized binaries. No
 
 ## Architecture
 
-**Single-file application** (`main.go`, ~675 lines). No packages, no modules beyond main.
+**Single-file application** (`main.go`, ~550 lines). No packages, no modules beyond main.
 
 ### Data Flow
 
@@ -30,19 +30,19 @@ stdin JSON → parse StatusLineInput → fetch external data in parallel → ren
 
 ### Three Output Lines
 
-1. **Model + Context + Usage**: Model name, context window progress bar (tokens), 5h/7d API usage limits with reset times
-2. **Workspace + Git**: Shortened CWD, git status (changes, staged, stash, unpushed, unpulled)
-3. **System + Session**: CPU/RAM mini progress bars, session duration
+1. **Model + Context + Usage**: Model name, context window progress bar (tokens, uses native `used_percentage`), 5h/7d rate limits with reset times (from native `rate_limits` JSON)
+2. **Workspace + Git + Worktree**: Shortened CWD, git status (changes, staged, stash, unpushed, unpulled), worktree name if active
+3. **System + Session + Cost**: CPU/RAM mini progress bars, session duration, session cost in USD
 
-### External Data Sources
+### Data Sources
+
+All model, context, rate limit, cost, and worktree data comes from Claude Code's native stdin JSON. External sources:
 
 | Source | Function | Notes |
 |--------|----------|-------|
-| Anthropic OAuth API | `fetchUsageFromAPI()` | 5s timeout, 60s file-based cache in `~/.claude/cache/usage_persist_cache.txt`, failed responses are never cached |
-| `~/.claude/.credentials.json` | `getAccessToken()` | OAuth token for API calls |
 | Git CLI commands | `getGitStatus()` | Uses `--no-optional-locks` and `core.useBuiltinFSMonitor=false` flags |
 | gopsutil library | `getSystemStats()` | CPU (100ms sample) and RAM percentage |
-| File timestamp | `getSessionDuration()` | Persisted in `~/.claude/cache/session_start.txt` |
+| Parent process | `getSessionDuration()` | Session duration from parent process creation time |
 
 ### Key Conventions
 
@@ -83,12 +83,6 @@ On Windows with Git Bash / MSYS2, the command path **must** use forward slashes 
 ```
 
 `make install` copies the binary to `~/.claude/` which resolves correctly on all platforms.
-
-## Environment Variables
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `STATUSLINE_DISABLE_USAGE` | *(unset)* | Set to `1` to disable the Anthropic usage API call entirely. Usage limits show "N/A". |
 
 ## Release
 
