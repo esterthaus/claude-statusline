@@ -7,14 +7,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
 	"github.com/shirou/gopsutil/v3/process"
+	"golang.org/x/term"
 )
 
 // ANSI Farben
@@ -187,93 +190,37 @@ func main() {
 		usage.SevenDayUtil = -1
 	}
 
-	// Git Status holen
-	gitStatus := getGitStatus(cwd)
-
-	// Zeile 1: Modell + Context + Usage Limits
-	line1 := fmt.Sprintf("%s%s%s%s  %s•%s  %s",
-		BrightMagenta+Bold, modelName, Reset,
-		"",
-		Dim, Reset,
-		renderProgressBarWithValues(currentTokens, contextSize, IconBrain+" Context", BrightCyan, 15),
-	)
-
-	// 5h Usage Limit
-	line1 += fmt.Sprintf("  %s•%s  ", Dim, Reset)
-	if usage.FiveHourUtil >= 0 {
-		line1 += renderProgressBar(usage.FiveHourUtil, 100, IconClock+" 5h", 12, BrightMagenta)
-		if usage.FiveHourReset > 0 {
-			resetTime := time.Unix(usage.FiveHourReset, 0)
-			timeUntil := time.Until(resetTime)
-			if timeUntil > 0 {
-				line1 += fmt.Sprintf(" %sin %s (%s)%s", Dim, formatDuration(timeUntil), resetTime.Local().Format("15:04"), Reset)
-			}
-		}
-	} else {
-		line1 += Dim + IconClock + " 5h: N/A" + Reset
+	// Terminalbreite ermitteln
+	termWidth := getTerminalWidth()
+	if termWidth < 40 {
+		// Minimal-Fallback bei extrem schmalen Terminals
+		fmt.Println(BrightMagenta + Bold + modelName + Reset)
+		fmt.Println(IconFolder + " " + Cyan + shortenPathTo(cwd, 30) + Reset)
+		fmt.Println(IconSession + " " + Dim + "..." + Reset)
+		return
 	}
 
-	// 7d Usage Limit
-	line1 += fmt.Sprintf("  %s•%s  ", Dim, Reset)
-	if usage.SevenDayUtil >= 0 {
-		line1 += renderProgressBar(usage.SevenDayUtil, 100, IconCalendar+" 7d", 12, BrightYellow)
-		if usage.SevenDayReset > 0 {
-			resetTime := time.Unix(usage.SevenDayReset, 0)
-			line1 += fmt.Sprintf(" %s%s%s", Dim, resetTime.Local().Format("02. Jan 15:04"), Reset)
-		}
-	} else {
-		line1 += Dim + IconCalendar + " 7d: N/A" + Reset
-	}
-
-	// System Stats holen
+	// Externe Daten holen
+	gitData := getGitData(resolveWorkDir(cwd))
 	cpuPercent, memPercent := getSystemStats()
 	sessionDur := getSessionDuration()
 
-	// Zeile 2: CWD + Git Status + Worktree
-	line2 := fmt.Sprintf("%s %s%s%s  %s•%s  %s %s",
-		IconFolder, Cyan, cwd, Reset,
-		Dim, Reset,
-		IconGit, gitStatus,
-	)
-
-	if input.Worktree != nil && input.Worktree.Name != "" {
-		line2 += fmt.Sprintf("  %s•%s  %s %s%s%s",
-			Dim, Reset,
-			IconWorktree, BrightGreen, input.Worktree.Name, Reset,
-		)
+	// Worktree-Name extrahieren
+	worktreeName := ""
+	if input.Worktree != nil {
+		worktreeName = input.Worktree.Name
 	}
 
-	// Zeile 3: System Stats + Session
-	line3 := fmt.Sprintf("%s CPU: %s %s%.0f%%%s",
-		IconCPU, renderMiniBar(cpuPercent, 8),
-		getColorForPercentage(int(cpuPercent)), cpuPercent, Reset,
-	)
-	line3 += fmt.Sprintf("  %s•%s  %s RAM: %s %s%.0f%%%s",
-		Dim, Reset,
-		IconRAM, renderMiniBar(memPercent, 8),
-		getColorForPercentage(int(memPercent)), memPercent, Reset,
-	)
-
-	// Session-Dauer
-	if sessionDur > 0 {
-		line3 += fmt.Sprintf("  %s•%s  %s Session: %s%s%s",
-			Dim, Reset,
-			IconSession, BrightCyan, formatSessionDuration(sessionDur), Reset,
-		)
-	} else {
-		line3 += fmt.Sprintf("  %s•%s  %s Session: %s<1m%s",
-			Dim, Reset,
-			IconSession, Dim, Reset,
-		)
+	// Kosten extrahieren
+	costUSD := 0.0
+	if input.Cost != nil {
+		costUSD = input.Cost.TotalCostUSD
 	}
 
-	// Kosten (nur anzeigen wenn vorhanden)
-	if input.Cost != nil && input.Cost.TotalCostUSD > 0 {
-		line3 += fmt.Sprintf("  %s•%s  %s %s$%.2f%s",
-			Dim, Reset,
-			IconCost, BrightYellow, input.Cost.TotalCostUSD, Reset,
-		)
-	}
+	// 3 Zeilen rendern
+	line1 := renderLine1(modelName, currentTokens, contextSize, usage, termWidth)
+	line2 := renderLine2(cwd, gitData, worktreeName, termWidth)
+	line3 := renderLine3(cpuPercent, memPercent, sessionDur, costUSD, termWidth)
 
 	fmt.Println(line1)
 	fmt.Println(line2)
@@ -327,6 +274,191 @@ func getColorForPercentage(percentage int) string {
 	}
 }
 
+// ansiRegex entfernt ANSI Escape-Sequences aus Strings
+var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// wideEmojis enthält die im Projekt verwendeten Emojis (2 Spalten breit)
+var wideEmojis = map[rune]bool{
+	'🧠': true, '💻': true, '🎛': true, '💰': true, '⏳': true,
+	'🌿': true, '📂': true, '⏱': true, '📅': true,
+}
+
+// visibleWidth berechnet die sichtbare Breite eines ANSI-farbigen Strings
+func visibleWidth(s string) int {
+	clean := ansiRegex.ReplaceAllString(s, "")
+	width := 0
+	for _, r := range clean {
+		if wideEmojis[r] {
+			width += 2
+		} else {
+			width++
+		}
+	}
+	return width
+}
+
+// truncateToWidth schneidet einen String auf maxWidth sichtbare Spalten ab
+func truncateToWidth(s string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+	var result strings.Builder
+	width := 0
+	i := 0
+	bytes := []byte(s)
+
+	for i < len(bytes) {
+		// ANSI Escape-Sequence erkennen und komplett durchlassen
+		if bytes[i] == '\x1b' && i+1 < len(bytes) && bytes[i+1] == '[' {
+			start := i
+			i += 2
+			for i < len(bytes) && bytes[i] != 'm' {
+				i++
+			}
+			if i < len(bytes) {
+				i++ // 'm' überspringen
+			}
+			result.Write(bytes[start:i])
+			continue
+		}
+
+		r, size := utf8.DecodeRune(bytes[i:])
+		runeWidth := 1
+		if wideEmojis[r] {
+			runeWidth = 2
+		}
+
+		if width+runeWidth > maxWidth {
+			break
+		}
+		result.WriteRune(r)
+		width += runeWidth
+		i += size
+	}
+
+	// Reset anhängen damit Farben nicht leaken
+	result.WriteString(Reset)
+	return result.String()
+}
+
+// shortenPathTo kürzt einen Pfad auf maxLen sichtbare Zeichen
+func shortenPathTo(path string, maxLen int) string {
+	if maxLen <= 0 {
+		return ""
+	}
+	// Erst Home-Verzeichnis ersetzen
+	path = shortenPath(path)
+
+	if utf8.RuneCountInString(path) <= maxLen {
+		return path
+	}
+
+	sep := string(filepath.Separator)
+	if runtime.GOOS == "windows" {
+		sep = "\\"
+	}
+	// Auch Forward-Slashes akzeptieren (Unix-Pfade in shortenPath verwenden /)
+	parts := strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' })
+
+	if len(parts) <= 1 {
+		// Nur ein Segment — direkt abschneiden
+		if utf8.RuneCountInString(path) > maxLen {
+			runes := []rune(path)
+			if maxLen > 1 {
+				return string(runes[:maxLen-1]) + "…"
+			}
+			return "…"
+		}
+		return path
+	}
+
+	// Prefix (~ oder Laufwerk)
+	prefix := ""
+	if strings.HasPrefix(path, "~") {
+		prefix = "~" + sep
+		parts = parts[1:] // ~ aus parts entfernen
+	} else if runtime.GOOS == "windows" && len(parts) > 0 && len(parts[0]) == 2 && parts[0][1] == ':' {
+		prefix = parts[0] + sep
+		parts = parts[1:]
+	}
+
+	if len(parts) == 0 {
+		return prefix
+	}
+
+	// Versuche schrittweise mittlere Segmente zu kürzen
+	last := parts[len(parts)-1]
+
+	// Minimale Darstellung: prefix + … + sep + last
+	minimal := prefix + "…" + sep + last
+	if utf8.RuneCountInString(minimal) > maxLen {
+		// Selbst minimal zu lang — nur letztes Verzeichnis
+		if utf8.RuneCountInString(last) > maxLen {
+			runes := []rune(last)
+			if maxLen > 1 {
+				return string(runes[:maxLen-1]) + "…"
+			}
+			return "…"
+		}
+		return last
+	}
+
+	// Von außen nach innen: erstes + letztes beibehalten, Mitte kürzen
+	for keep := len(parts) - 1; keep >= 1; keep-- {
+		// Behalte erste 'keep-1' Segmente und letztes Segment
+		kept := parts[:keep-1]
+		candidate := prefix + strings.Join(kept, sep) + sep + "…" + sep + last
+		if keep == 1 {
+			candidate = prefix + "…" + sep + last
+		}
+		if utf8.RuneCountInString(candidate) <= maxLen {
+			// Versuche mehr Segmente einzubauen
+			best := candidate
+			for j := keep; j < len(parts)-1; j++ {
+				trial := prefix + strings.Join(parts[:j], sep) + sep + "…" + sep + last
+				if utf8.RuneCountInString(trial) <= maxLen {
+					best = trial
+				} else {
+					break
+				}
+			}
+			return best
+		}
+	}
+
+	return minimal
+}
+
+// getTerminalWidth ermittelt die Terminalbreite
+func getTerminalWidth() int {
+	// 1. COLUMNS env-Variable (höchste Priorität, z.B. für Tests)
+	if cols := os.Getenv("COLUMNS"); cols != "" {
+		if w, err := strconv.Atoi(cols); err == nil && w > 0 {
+			return w
+		}
+	}
+
+	// 2. Plattform-spezifisch Console-Handle öffnen (funktioniert auch bei gepipted stdout)
+	if runtime.GOOS == "windows" {
+		if f, err := os.Open("CONOUT$"); err == nil {
+			defer f.Close()
+			if w, _, err := term.GetSize(int(f.Fd())); err == nil && w > 0 {
+				return w
+			}
+		}
+	} else {
+		if f, err := os.Open("/dev/tty"); err == nil {
+			defer f.Close()
+			if w, _, err := term.GetSize(int(f.Fd())); err == nil && w > 0 {
+				return w
+			}
+		}
+	}
+
+	// 3. Fallback
+	return 120
+}
+
 // renderProgressBar rendert eine Progress Bar (ohne Werte)
 func renderProgressBar(current, max int, label string, width int, labelColor string) string {
 	if max == 0 {
@@ -377,64 +509,434 @@ func renderProgressBarWithValues(current, max int, label, labelColor string, wid
 	)
 }
 
-// getGitStatus holt den Git-Status
-func getGitStatus(cwd string) string {
-	workDir := resolveWorkDir(cwd)
+// --- Zeilen-Layout-Funktionen ---
 
-	// Prüfe ob wir in einem Git-Repository sind
+// makeSep erzeugt den Standard-Separator
+func makeSep() string {
+	return "  " + Dim + "•" + Reset + "  "
+}
+
+const sepVisibleWidth = 5 // sichtbare Breite von "  •  "
+
+// renderLine1 rendert Zeile 1: Model + Context + Rate Limits
+func renderLine1(modelName string, currentTokens, contextSize int, usage UsageData, termWidth int) string {
+	showBars := termWidth >= 100
+	sep := makeSep()
+
+	show7Day := termWidth >= 80 && usage.SevenDayUtil >= 0
+
+	// Separator-Budget
+	numSeps := 2 // Model•Context•5h
+	if show7Day {
+		numSeps = 3
+	}
+
+	// Model bekommt was es braucht
+	modelStr := BrightMagenta + Bold + modelName + Reset
+	modelWidth := visibleWidth(modelStr)
+
+	available := termWidth - (numSeps * sepVisibleWidth) - modelWidth
+
+	// Budget aufteilen
+	var ctxBudget, fiveHBudget, sevenDBudget int
+	if show7Day {
+		ctxBudget = available * 40 / 100
+		fiveHBudget = available * 30 / 100
+		sevenDBudget = available * 20 / 100
+		// Rundungsrest an Context
+		ctxBudget += available - ctxBudget - fiveHBudget - sevenDBudget
+	} else {
+		ctxBudget = available * 55 / 100
+		fiveHBudget = available * 40 / 100
+		// Rundungsrest an Context
+		ctxBudget += available - ctxBudget - fiveHBudget
+	}
+
+	parts := []string{modelStr}
+	parts = append(parts, renderContextElement(currentTokens, contextSize, ctxBudget, showBars))
+
+	if usage.FiveHourUtil >= 0 {
+		parts = append(parts, renderRateLimitElement(usage.FiveHourUtil, usage.FiveHourReset, "5h", IconClock, fiveHBudget, showBars, BrightMagenta))
+	} else {
+		parts = append(parts, Dim+IconClock+" 5h: N/A"+Reset)
+	}
+
+	if show7Day {
+		parts = append(parts, renderRateLimitElement(usage.SevenDayUtil, usage.SevenDayReset, "7d", IconCalendar, sevenDBudget, showBars, BrightYellow))
+	}
+
+	line := strings.Join(parts, sep)
+	return truncateToWidth(line, termWidth)
+}
+
+// renderLine2 rendert Zeile 2: CWD + Git + Worktree
+func renderLine2(cwd string, gitData GitData, worktreeName string, termWidth int) string {
+	sep := makeSep()
+
+	showWorktree := termWidth >= 100 && worktreeName != ""
+
+	numSeps := 1 // CWD•Git
+	if showWorktree {
+		numSeps = 2
+	}
+
+	available := termWidth - (numSeps * sepVisibleWidth)
+
+	// Budget aufteilen
+	var cwdBudget, gitBudget, worktreeBudget int
+	if showWorktree {
+		cwdBudget = available * 30 / 100
+		gitBudget = available * 50 / 100
+		worktreeBudget = available * 20 / 100
+		cwdBudget += available - cwdBudget - gitBudget - worktreeBudget
+	} else {
+		cwdBudget = available * 35 / 100
+		gitBudget = available * 65 / 100
+		cwdBudget += available - cwdBudget - gitBudget
+	}
+
+	// CWD rendern (Icon 📂 = 2 Spalten + Space = 3)
+	cwdPathBudget := cwdBudget - 3
+	if cwdPathBudget < 5 {
+		cwdPathBudget = 5
+	}
+	shortenedCwd := shortenPathTo(cwd, cwdPathBudget)
+	cwdStr := fmt.Sprintf("%s %s%s%s", IconFolder, Cyan, shortenedCwd, Reset)
+
+	// Git rendern (Icon ⎇ = 1 Spalte + Space = 2)
+	gitBudgetForContent := gitBudget - 2
+	if gitBudgetForContent < 5 {
+		gitBudgetForContent = 5
+	}
+	gitStr := fmt.Sprintf("%s %s", IconGit, renderGitElement(gitData, gitBudgetForContent))
+
+	parts := []string{cwdStr, gitStr}
+
+	if showWorktree {
+		wtStr := fmt.Sprintf("%s %s%s%s", IconWorktree, BrightGreen, worktreeName, Reset)
+		parts = append(parts, wtStr)
+	}
+
+	line := strings.Join(parts, sep)
+	return truncateToWidth(line, termWidth)
+}
+
+// renderLine3 rendert Zeile 3: System Stats + Session + Cost
+func renderLine3(cpuPct, memPct float64, sessionDur time.Duration, costUSD float64, termWidth int) string {
+	showBars := termWidth >= 100
+	sep := makeSep()
+
+	// Elemente sammeln
+	type lineElement struct {
+		str string
+	}
+	var parts []lineElement
+
+	if termWidth >= 70 {
+		// CPU und RAM separat
+		cpuBudget := 15
+		ramBudget := 15
+		if termWidth < 100 {
+			cpuBudget = 8
+			ramBudget = 8
+		}
+		parts = append(parts, lineElement{renderSystemElement(IconCPU, "CPU", cpuPct, cpuBudget, showBars)})
+		parts = append(parts, lineElement{renderSystemElement(IconRAM, "RAM", memPct, ramBudget, showBars)})
+	} else {
+		// CPU/RAM kompakt zusammen
+		cpuColor := getColorForPercentage(int(cpuPct))
+		ramColor := getColorForPercentage(int(memPct))
+		compact := fmt.Sprintf("C%s%.0f%%%s R%s%.0f%%%s",
+			cpuColor, cpuPct, Reset,
+			ramColor, memPct, Reset,
+		)
+		parts = append(parts, lineElement{compact})
+	}
+
+	// Session
+	if sessionDur > 0 {
+		parts = append(parts, lineElement{
+			fmt.Sprintf("%s %s%s%s", IconSession, BrightCyan, formatSessionDuration(sessionDur), Reset),
+		})
+	} else {
+		parts = append(parts, lineElement{
+			fmt.Sprintf("%s %s<1m%s", IconSession, Dim, Reset),
+		})
+	}
+
+	// Cost
+	if costUSD > 0 {
+		parts = append(parts, lineElement{
+			fmt.Sprintf("%s %s$%.2f%s", IconCost, BrightYellow, costUSD, Reset),
+		})
+	}
+
+	strs := make([]string, len(parts))
+	for i, p := range parts {
+		strs[i] = p.str
+	}
+	line := strings.Join(strs, sep)
+	return truncateToWidth(line, termWidth)
+}
+
+// --- Adaptive Render-Funktionen ---
+
+// renderModelElement rendert den Model-Namen adaptiv
+func renderModelElement(name string, budget int) string {
+	styled := BrightMagenta + Bold + name + Reset
+	if visibleWidth(styled) <= budget {
+		return styled
+	}
+	// Abkürzen wenn zu wenig Platz
+	runes := []rune(name)
+	for len(runes) > 1 && visibleWidth(BrightMagenta+Bold+string(runes)+Reset) > budget {
+		runes = runes[:len(runes)-1]
+	}
+	return BrightMagenta + Bold + string(runes) + Reset
+}
+
+// renderContextElement rendert die Context-Anzeige adaptiv
+func renderContextElement(current, max, budget int, showBars bool) string {
+	if max == 0 {
+		return Dim + IconBrain + " Ctx: N/A" + Reset
+	}
+
+	percentage := current * 100 / max
+	color := getColorForPercentage(percentage)
+	currentFmt := formatWithKSuffix(current)
+	maxFmt := formatWithKSuffix(max)
+
+	if showBars && budget >= 24 {
+		// Volle Bar-Darstellung: "🧠 Ctx: 52k/200k ████░░ 26%"
+		// 🧠(2) + " Ctx: "(6) + values(~9) + " "(1) + bar + " "(1) + pct(~3) ≈ 22 + barWidth
+		barWidth := budget - 22
+		if barWidth < 3 {
+			barWidth = 3
+		}
+		if barWidth > 20 {
+			barWidth = 20
+		}
+		return renderProgressBarWithValues(current, max, IconBrain+" Ctx", BrightCyan, barWidth)
+	}
+
+	if budget >= 20 {
+		// Kompakt mit Werten: "🧠 Ctx: 52k/200k 26%" ≈ 20 sichtbare Zeichen
+		return fmt.Sprintf("%s%s Ctx:%s %s/%s %s%d%%%s",
+			BrightCyan, IconBrain, Reset,
+			currentFmt, maxFmt,
+			color, percentage, Reset,
+		)
+	}
+
+	// Minimal: "🧠 Ctx: 26%" ≈ 11 sichtbare Zeichen
+	return fmt.Sprintf("%s%s Ctx:%s %s%d%%%s",
+		BrightCyan, IconBrain, Reset,
+		color, percentage, Reset,
+	)
+}
+
+// renderRateLimitElement rendert ein Rate-Limit-Element adaptiv
+func renderRateLimitElement(pct int, resetTs int64, label, icon string, budget int, showBars bool, labelColor string) string {
+	if pct < 0 {
+		return Dim + icon + " " + label + ": N/A" + Reset
+	}
+
+	color := getColorForPercentage(pct)
+
+	if showBars && budget >= 20 {
+		// Bar + optional Reset-Zeit: ⏱(2) + " 5h:"(4) + " "(1) + bar + " "(1) + pct(~3) ≈ 11 + barWidth
+		barWidth := budget - 14
+		if barWidth < 3 {
+			barWidth = 3
+		}
+		if barWidth > 15 {
+			barWidth = 15
+		}
+		result := renderProgressBar(pct, 100, icon+" "+label, barWidth, labelColor)
+		// Reset-Zeit anhängen wenn Platz
+		if resetTs > 0 {
+			resetTime := time.Unix(resetTs, 0)
+			timeUntil := time.Until(resetTime)
+			if timeUntil > 0 {
+				resetStr := fmt.Sprintf(" %sin %s (%s)%s", Dim, formatDuration(timeUntil), resetTime.Local().Format("15:04"), Reset)
+				if visibleWidth(result)+visibleWidth(resetStr) <= budget {
+					result += resetStr
+				} else {
+					// Nur Uhrzeit wenn Platz
+					shortReset := fmt.Sprintf(" %s%s%s", Dim, resetTime.Local().Format("15:04"), Reset)
+					if visibleWidth(result)+visibleWidth(shortReset) <= budget {
+						result += shortReset
+					}
+				}
+			}
+		}
+		return result
+	}
+
+	if budget >= 10 {
+		// Kompakt: "⏱ 5h: 45% 12:30" ≈ 10 + optional 6 für Zeit
+		result := fmt.Sprintf("%s%s %s:%s %s%d%%%s",
+			labelColor, icon, label, Reset,
+			color, pct, Reset,
+		)
+		if resetTs > 0 {
+			resetTime := time.Unix(resetTs, 0)
+			timeStr := fmt.Sprintf(" %s%s%s", Dim, resetTime.Local().Format("15:04"), Reset)
+			if visibleWidth(result)+visibleWidth(timeStr) <= budget {
+				result += timeStr
+			}
+		}
+		return result
+	}
+
+	// Minimal: "⏱ 5h: 45%"
+	return fmt.Sprintf("%s%s %s:%s %s%d%%%s",
+		labelColor, icon, label, Reset,
+		color, pct, Reset,
+	)
+}
+
+// renderGitElement rendert den Git-Status adaptiv
+func renderGitElement(data GitData, budget int) string {
+	if !data.IsRepo {
+		return Dim + "N/A" + Reset
+	}
+
+	sep := " " + Dim + "|" + Reset + " "
+	sepWidth := 3 // sichtbare Breite von " | "
+
+	// Alle möglichen Parts mit ihrer sichtbaren Breite vorbereiten
+	type part struct {
+		str      string
+		priority int // 1=höchste
+	}
+
+	var allParts []part
+
+	// Änderungen (Prio 1)
+	if data.Changes > 0 {
+		allParts = append(allParts, part{fmt.Sprintf("%sÄnd: %d%s", Yellow, data.Changes, Reset), 1})
+	} else {
+		allParts = append(allParts, part{Dim + "Änd: 0" + Reset, 1})
+	}
+
+	// Staged (Prio 2)
+	if data.Staged > 0 {
+		allParts = append(allParts, part{fmt.Sprintf("%sStg: %d%s", BrightGreen, data.Staged, Reset), 2})
+	} else {
+		allParts = append(allParts, part{Dim + "Stg: 0" + Reset, 2})
+	}
+
+	// Stash (Prio 4)
+	if data.Stash > 0 {
+		allParts = append(allParts, part{fmt.Sprintf("%sStash: %d%s", Cyan, data.Stash, Reset), 4})
+	}
+
+	// Unpushed (Prio 2)
+	if data.HasUpstream {
+		if data.Unpushed > 0 {
+			allParts = append(allParts, part{fmt.Sprintf("%s↑%d%s", BrightGreen, data.Unpushed, Reset), 2})
+		} else {
+			allParts = append(allParts, part{Dim + "↑0" + Reset, 3})
+		}
+	}
+
+	// Unpulled (Prio 3)
+	if data.HasUpstream {
+		if data.Unpulled > 0 {
+			allParts = append(allParts, part{fmt.Sprintf("%s↓%d%s", Blue, data.Unpulled, Reset), 3})
+		} else {
+			allParts = append(allParts, part{Dim + "↓0" + Reset, 4})
+		}
+	}
+
+	// Parts nach Budget filtern — von hinten (niedrigste Prio) entfernen
+	for len(allParts) > 1 {
+		totalWidth := 0
+		for i, p := range allParts {
+			totalWidth += visibleWidth(p.str)
+			if i > 0 {
+				totalWidth += sepWidth
+			}
+		}
+		if totalWidth <= budget {
+			break
+		}
+		// Entferne Part mit höchster Prio-Zahl (niedrigste Priorität)
+		worstIdx := 0
+		worstPrio := 0
+		for i, p := range allParts {
+			if p.priority > worstPrio {
+				worstPrio = p.priority
+				worstIdx = i
+			}
+		}
+		allParts = append(allParts[:worstIdx], allParts[worstIdx+1:]...)
+	}
+
+	// Parts zusammenfügen
+	strs := make([]string, len(allParts))
+	for i, p := range allParts {
+		strs[i] = p.str
+	}
+	return strings.Join(strs, sep)
+}
+
+// renderSystemElement rendert CPU oder RAM adaptiv
+func renderSystemElement(icon, label string, pct float64, budget int, showBars bool) string {
+	color := getColorForPercentage(int(pct))
+
+	if showBars && budget >= 12 {
+		barWidth := budget - 8
+		if barWidth < 3 {
+			barWidth = 3
+		}
+		if barWidth > 10 {
+			barWidth = 10
+		}
+		return fmt.Sprintf("%s %s: %s %s%.0f%%%s",
+			icon, label, renderMiniBar(pct, barWidth),
+			color, pct, Reset,
+		)
+	}
+
+	if budget >= 6 {
+		return fmt.Sprintf("%s %s%.0f%%%s", label, color, pct, Reset)
+	}
+
+	// Minimal: "C52%"
+	short := label
+	if len(short) > 1 {
+		short = string([]rune(short)[0:1])
+	}
+	return fmt.Sprintf("%s%s%.0f%%%s", short, color, pct, Reset)
+}
+
+// GitData enthält die rohen Git-Statusdaten (ohne Rendering)
+type GitData struct {
+	Changes     int
+	Staged      int
+	Stash       int
+	Unpushed    int  // -1 = kein Upstream
+	Unpulled    int  // -1 = kein Upstream
+	IsRepo      bool
+	HasUpstream bool
+}
+
+// getGitData holt die Git-Statusdaten (nur I/O, kein Rendering)
+func getGitData(workDir string) GitData {
 	if !isGitRepo(workDir) {
-		return Dim + "Änderungen: N/A | Staged: N/A | Stash: N/A | Unpushed: N/A | Unpulled: N/A" + Reset
+		return GitData{IsRepo: false}
 	}
 
-	var parts []string
+	data := GitData{IsRepo: true}
+	data.Changes = gitCountLines(workDir, "status", "--porcelain")
+	data.Staged = gitCountLines(workDir, "diff", "--cached", "--numstat")
+	data.Stash = gitCountLines(workDir, "stash", "list")
+	data.Unpushed, data.Unpulled = getUnpushedUnpulled(workDir)
+	data.HasUpstream = data.Unpushed >= 0
 
-	// 1. Uncommitted changes
-	changes := gitCountLines(workDir, "status", "--porcelain")
-	if changes > 0 {
-		parts = append(parts, fmt.Sprintf("%sÄnderungen: %d%s", Yellow, changes, Reset))
-	} else {
-		parts = append(parts, Dim+"Änderungen: 0"+Reset)
-	}
-
-	// 2. Staged changes
-	staged := gitCountLines(workDir, "diff", "--cached", "--numstat")
-	if staged > 0 {
-		parts = append(parts, fmt.Sprintf("%sStaged: %d%s", BrightGreen, staged, Reset))
-	} else {
-		parts = append(parts, Dim+"Staged: 0"+Reset)
-	}
-
-	// 3. Stash count
-	stashCount := gitCountLines(workDir, "stash", "list")
-	if stashCount > 0 {
-		parts = append(parts, fmt.Sprintf("%sStash: %d%s", Cyan, stashCount, Reset))
-	} else {
-		parts = append(parts, Dim+"Stash: 0"+Reset)
-	}
-
-	// 4. Unpushed/Unpulled
-	unpushed, unpulled := getUnpushedUnpulled(workDir)
-	if unpushed >= 0 {
-		if unpushed > 0 {
-			parts = append(parts, fmt.Sprintf("%sUnpushed: %d%s", BrightGreen, unpushed, Reset))
-		} else {
-			parts = append(parts, Dim+"Unpushed: 0"+Reset)
-		}
-	} else {
-		parts = append(parts, Dim+"Unpushed: N/A"+Reset)
-	}
-
-	if unpulled >= 0 {
-		if unpulled > 0 {
-			parts = append(parts, fmt.Sprintf("%sUnpulled: %d%s", Blue, unpulled, Reset))
-		} else {
-			parts = append(parts, Dim+"Unpulled: 0"+Reset)
-		}
-	} else {
-		parts = append(parts, Dim+"Unpulled: N/A"+Reset)
-	}
-
-	return strings.Join(parts, " "+Dim+"|"+Reset+" ")
+	return data
 }
 
 // isGitRepo prüft ob das Verzeichnis ein Git-Repository ist
