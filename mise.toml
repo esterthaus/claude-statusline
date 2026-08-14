@@ -1,0 +1,9 @@
+[tools]
+# Pin auf die Toolchain-Zeile aus go.mod ("go 1.25.6").
+go = "1.25.6"
+
+# Go-LSP + Debugger ueber mise statt ueber "Go: Install/Update Tools" der VS-Code-Extension:
+# so landen sie im mise-Volume (ueberleben Rebuilds), liegen per Shim auf dem PATH und stehen
+# damit auch Helix/Neovim aus ct-editors zur Verfuegung — nicht nur VS Code.
+"go:golang.org/x/tools/gopls"          = "latest"
+"go:github.com/go-delve/delve/cmd/dlv" = "latest"

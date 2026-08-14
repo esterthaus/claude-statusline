@@ -16,6 +16,9 @@ dist/
 *.swp
 *.swo
 
+# Claude Code (lokale Freigaben, nicht teilen)
+.claude/settings.local.json
+
 # OS
 .DS_Store
 Thumbs.db
