@@ -47,7 +47,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version-file: go.mod
 
       - name: Build binary
         env:
@@ -92,23 +92,25 @@ jobs:
           fi
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.version.outputs.version }}
           name: Claude Statusline ${{ steps.version.outputs.version }}
           body: |
-            ## Claude Code Statusline ${{ steps.version.outputs.version }}
+            ## Statusline ${{ steps.version.outputs.version }}
 
-            Cross-platform statusline for Claude Code CLI.
+            Cross-platform statusline for Claude Code and GitHub Copilot CLI.
+            One binary serves both — the JSON dialect is detected automatically.
 
             ### Features
             - Model name and context window progress
-            - 5h and 7d usage limits with reset times
+            - Claude Code: 5h/7d usage limits with reset times, session cost in USD
+            - Copilot CLI: AIU consumption, changed lines, API time
             - Git status (changes, staged, stash, unpushed/unpulled)
             - CPU and RAM utilization
             - Session duration tracking
 
-            ### Installation
+            ### Installation — Claude Code
             1. Download the binary for your platform
             2. Place it in `~/.claude/` (rename to `claude-statusline.exe` on Windows or `claude-statusline` on Linux/macOS)
             3. Add to `~/.claude/settings.json`:
@@ -120,6 +122,21 @@ jobs:
               }
             }
             ```
+
+            ### Installation — GitHub Copilot CLI
+            1. Download the binary for your platform
+            2. Place it in `~/.copilot/` as `statusline` (`statusline.exe` on Windows)
+            3. Add to `~/.copilot/settings.json`:
+            ```json
+            {
+              "statusLine": {
+                "type": "command",
+                "command": "~/.copilot/statusline"
+              }
+            }
+            ```
+            Verified against Copilot CLI 1.0.80, where the status line is no longer
+            experimental. Older versions may still require the `STATUS_LINE` feature flag.
 
             ### Binaries
             - **Windows**: `claude-statusline-windows-amd64.exe` / `claude-statusline-windows-arm64.exe`
