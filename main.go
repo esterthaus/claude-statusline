@@ -53,9 +53,10 @@ const (
 	IconSession  = "⏳"
 	IconCost     = "💰"
 	IconWorktree = "🌿"
+	IconAIU      = "⚡"
 )
 
-// Input JSON Struktur (von Claude Code)
+// Input JSON Struktur (von Claude Code bzw. Copilot CLI)
 type StatusLineInput struct {
 	ContextWindow struct {
 		CurrentUsage *struct {
@@ -68,6 +69,10 @@ type StatusLineInput struct {
 		ContextWindowSize   int  `json:"context_window_size"`
 		UsedPercentage      *float64 `json:"used_percentage"`
 		RemainingPercentage *float64 `json:"remaining_percentage"`
+		// Copilot CLI: Display-Sicht (das, was /context anzeigt).
+		// used_percentage bezieht sich dort nur auf den letzten Call.
+		CurrentContextTokens  *int `json:"current_context_tokens"`
+		DisplayedContextLimit *int `json:"displayed_context_limit"`
 	} `json:"context_window"`
 	Model struct {
 		ID          string `json:"id"`
@@ -107,10 +112,17 @@ type StatusLineInput struct {
 			ResetsAt       float64 `json:"resets_at"`
 		} `json:"seven_day"`
 	} `json:"rate_limits"`
-	Version           string `json:"version"`
-	SessionID         string `json:"session_id"`
-	Cwd               string `json:"cwd"`
-	Exceeds200kTokens bool   `json:"exceeds_200k_tokens"`
+	// Copilot CLI: AIU-Verbrauch, ersetzt die Rate-Limit-Anzeige
+	AIUsed *struct {
+		TotalNanoAIU int64  `json:"total_nano_aiu"`
+		Formatted    string `json:"formatted"`
+	} `json:"ai_used"`
+	// Copilot CLI: nur als Erkennungsmerkmal, der Inhalt wird nicht ausgewertet
+	Remote            *json.RawMessage `json:"remote"`
+	Version           string           `json:"version"`
+	SessionID         string           `json:"session_id"`
+	Cwd               string           `json:"cwd"`
+	Exceeds200kTokens bool             `json:"exceeds_200k_tokens"`
 }
 
 // UsageData fuer Rate-Limit-Anzeige
@@ -119,6 +131,134 @@ type UsageData struct {
 	SevenDayUtil   int
 	FiveHourReset  int64
 	SevenDayReset  int64
+}
+
+// Flavor unterscheidet die CLI, die das JSON geliefert hat
+type Flavor int
+
+const (
+	FlavorClaude Flavor = iota
+	FlavorCopilot
+)
+
+// Statusline enthält die normalisierten Anzeigedaten beider JSON-Dialekte
+type Statusline struct {
+	Flavor        Flavor
+	ModelName     string
+	Cwd           string
+	CurrentTokens int
+	ContextSize   int
+
+	// Nur Claude Code
+	Usage        UsageData
+	WorktreeName string
+	CostUSD      float64
+
+	// Nur Copilot CLI
+	AIU          string
+	LinesAdded   int
+	LinesRemoved int
+	APIDuration  time.Duration
+	SessionDur   time.Duration // 0 = auf Prozess-Heuristik zurückfallen
+}
+
+// detectFlavor erkennt Copilot CLI an Feldern, die Claude Code nicht liefert
+func detectFlavor(in StatusLineInput) Flavor {
+	if in.Remote != nil || in.AIUsed != nil || in.ContextWindow.CurrentContextTokens != nil {
+		return FlavorCopilot
+	}
+	return FlavorClaude
+}
+
+// normalize überführt das Eingabe-JSON in die flavor-unabhängige Anzeigestruktur
+func normalize(in StatusLineInput) Statusline {
+	s := Statusline{Flavor: detectFlavor(in)}
+
+	s.ModelName = in.Model.DisplayName
+	if s.ModelName == "" {
+		s.ModelName = "Unknown"
+	}
+
+	cwd := in.Workspace.CurrentDir
+	if cwd == "" {
+		cwd = in.Cwd
+	}
+	if cwd == "" {
+		cwd = "~"
+	}
+	s.Cwd = shortenPath(cwd)
+
+	if s.Flavor == FlavorCopilot {
+		s.CurrentTokens, s.ContextSize = copilotContext(in)
+		if in.AIUsed != nil {
+			s.AIU = in.AIUsed.Formatted
+		}
+		if in.Cost != nil {
+			s.LinesAdded = in.Cost.TotalLinesAdded
+			s.LinesRemoved = in.Cost.TotalLinesRemoved
+			s.APIDuration = time.Duration(in.Cost.TotalAPIDurationMs) * time.Millisecond
+			// Copilot liefert die Session-Dauer direkt (Date.now() - sessionStartTime)
+			s.SessionDur = time.Duration(in.Cost.TotalDurationMs) * time.Millisecond
+		}
+		return s
+	}
+
+	s.CurrentTokens, s.ContextSize = claudeContext(in)
+	s.Usage = extractRateLimits(in)
+	if in.Worktree != nil {
+		s.WorktreeName = in.Worktree.Name
+	}
+	if in.Cost != nil {
+		s.CostUSD = in.Cost.TotalCostUSD
+	}
+	return s
+}
+
+// claudeContext nutzt die native used_percentage, Fallback auf manuelle Berechnung
+func claudeContext(in StatusLineInput) (tokens, size int) {
+	cw := in.ContextWindow
+	size = cw.ContextWindowSize
+	if size == 0 {
+		size = 200000
+	}
+
+	if cw.UsedPercentage != nil {
+		tokens = int(*cw.UsedPercentage) * size / 100
+	} else if cw.CurrentUsage != nil {
+		tokens = cw.CurrentUsage.InputTokens + cw.CurrentUsage.CacheCreationInputTokens + cw.CurrentUsage.CacheReadInputTokens
+	}
+	return
+}
+
+// copilotContext nutzt die Display-Sicht; ohne Limit bleibt size 0 → "Ctx: N/A"
+func copilotContext(in StatusLineInput) (tokens, size int) {
+	cw := in.ContextWindow
+	if cw.CurrentContextTokens != nil {
+		tokens = *cw.CurrentContextTokens
+	}
+	if cw.DisplayedContextLimit != nil && *cw.DisplayedContextLimit > 0 {
+		size = *cw.DisplayedContextLimit
+	} else {
+		size = cw.ContextWindowSize
+	}
+	return
+}
+
+// extractRateLimits liest die Rate Limits, -1 markiert fehlende Werte
+func extractRateLimits(in StatusLineInput) UsageData {
+	usage := UsageData{FiveHourUtil: -1, SevenDayUtil: -1}
+	if in.RateLimits == nil {
+		return usage
+	}
+	if in.RateLimits.FiveHour != nil {
+		usage.FiveHourUtil = int(in.RateLimits.FiveHour.UsedPercentage)
+		usage.FiveHourReset = int64(in.RateLimits.FiveHour.ResetsAt)
+	}
+	if in.RateLimits.SevenDay != nil {
+		usage.SevenDayUtil = int(in.RateLimits.SevenDay.UsedPercentage)
+		usage.SevenDayReset = int64(in.RateLimits.SevenDay.ResetsAt)
+	}
+	return usage
 }
 
 func main() {
@@ -141,86 +281,48 @@ func main() {
 		return
 	}
 
-	// Daten extrahieren
-	modelName := input.Model.DisplayName
-	if modelName == "" {
-		modelName = "Unknown"
-	}
-
-	cwd := input.Workspace.CurrentDir
-	if cwd == "" {
-		cwd = input.Cwd
-	}
-	if cwd == "" {
-		cwd = "~"
-	}
-	cwd = shortenPath(cwd)
-
-	// Context Window: native used_percentage nutzen, Fallback auf manuelle Berechnung
-	var currentTokens int
-	contextSize := input.ContextWindow.ContextWindowSize
-	if contextSize == 0 {
-		contextSize = 200000
-	}
-
-	if input.ContextWindow.UsedPercentage != nil {
-		currentTokens = int(*input.ContextWindow.UsedPercentage) * contextSize / 100
-	} else if input.ContextWindow.CurrentUsage != nil {
-		cu := input.ContextWindow.CurrentUsage
-		currentTokens = cu.InputTokens + cu.CacheCreationInputTokens + cu.CacheReadInputTokens
-	}
-
-	// Usage Limits aus stdin-JSON (nativ von Claude Code)
-	var usage UsageData
-	if input.RateLimits != nil {
-		if input.RateLimits.FiveHour != nil {
-			usage.FiveHourUtil = int(input.RateLimits.FiveHour.UsedPercentage)
-			usage.FiveHourReset = int64(input.RateLimits.FiveHour.ResetsAt)
-		} else {
-			usage.FiveHourUtil = -1
-		}
-		if input.RateLimits.SevenDay != nil {
-			usage.SevenDayUtil = int(input.RateLimits.SevenDay.UsedPercentage)
-			usage.SevenDayReset = int64(input.RateLimits.SevenDay.ResetsAt)
-		} else {
-			usage.SevenDayUtil = -1
-		}
-	} else {
-		usage.FiveHourUtil = -1
-		usage.SevenDayUtil = -1
-	}
+	// Daten normalisieren (Claude Code oder Copilot CLI)
+	s := normalize(input)
 
 	// Terminalbreite ermitteln
 	termWidth := getTerminalWidth()
+
+	// DEBUG: in Datei loggen (stört Claude Code nicht)
+	if f, err := os.OpenFile(filepath.Join(os.TempDir(), "statusline-debug.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err == nil {
+		stderrW, _, stderrErr := term.GetSize(int(os.Stderr.Fd()))
+		tputOut, _ := exec.Command("tput", "cols").Output()
+		ttyW, ttyErr := 0, error(nil)
+		if tty, err := os.Open("/dev/tty"); err == nil {
+			ttyW, _, ttyErr = term.GetSize(int(tty.Fd()))
+			tty.Close()
+		} else {
+			ttyErr = err
+		}
+		fmt.Fprintf(f, "termWidth=%d COLUMNS=%q stderrW=%d stderrErr=%v ttyW=%d ttyErr=%v tput=%q TERM=%q\n",
+			termWidth, os.Getenv("COLUMNS"), stderrW, stderrErr, ttyW, ttyErr, strings.TrimSpace(string(tputOut)), os.Getenv("TERM"))
+		f.Close()
+	}
+
 	if termWidth < 40 {
 		// Minimal-Fallback bei extrem schmalen Terminals
-		fmt.Println(BrightMagenta + Bold + modelName + Reset)
-		fmt.Println(IconFolder + " " + Cyan + shortenPathTo(cwd, 30) + Reset)
+		fmt.Println(BrightMagenta + Bold + s.ModelName + Reset)
+		fmt.Println(IconFolder + " " + Cyan + shortenPathTo(s.Cwd, 30) + Reset)
 		fmt.Println(IconSession + " " + Dim + "..." + Reset)
 		return
 	}
 
 	// Externe Daten holen
-	gitData := getGitData(resolveWorkDir(cwd))
+	gitData := getGitData(resolveWorkDir(s.Cwd))
 	cpuPercent, memPercent := getSystemStats()
-	sessionDur := getSessionDuration()
-
-	// Worktree-Name extrahieren
-	worktreeName := ""
-	if input.Worktree != nil {
-		worktreeName = input.Worktree.Name
-	}
-
-	// Kosten extrahieren
-	costUSD := 0.0
-	if input.Cost != nil {
-		costUSD = input.Cost.TotalCostUSD
+	sessionDur := s.SessionDur
+	if sessionDur == 0 {
+		sessionDur = getSessionDuration()
 	}
 
 	// 3 Zeilen rendern
-	line1 := renderLine1(modelName, currentTokens, contextSize, usage, termWidth)
-	line2 := renderLine2(cwd, gitData, worktreeName, termWidth)
-	line3 := renderLine3(cpuPercent, memPercent, sessionDur, costUSD, termWidth)
+	line1 := renderLine1(s, termWidth)
+	line2 := renderLine2(s.Cwd, gitData, s.WorktreeName, termWidth)
+	line3 := renderLine3(s, cpuPercent, memPercent, sessionDur, termWidth)
 
 	fmt.Println(line1)
 	fmt.Println(line2)
@@ -280,7 +382,7 @@ var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 // wideEmojis enthält die im Projekt verwendeten Emojis (2 Spalten breit)
 var wideEmojis = map[rune]bool{
 	'🧠': true, '💻': true, '🎛': true, '💰': true, '⏳': true,
-	'🌿': true, '📂': true, '⏱': true, '📅': true,
+	'🌿': true, '📂': true, '⏱': true, '📅': true, '⚡': true,
 }
 
 // visibleWidth berechnet die sichtbare Breite eines ANSI-farbigen Strings
@@ -438,15 +540,15 @@ func getTerminalWidth() int {
 		}
 	}
 
-	// 2. Plattform-spezifisch Console-Handle öffnen (funktioniert auch bei gepipted stdout)
-	if runtime.GOOS == "windows" {
-		if f, err := os.Open("CONOUT$"); err == nil {
-			defer f.Close()
-			if w, _, err := term.GetSize(int(f.Fd())); err == nil && w > 0 {
-				return w
-			}
-		}
-	} else {
+	// 2. stderr-Fd abfragen — Claude Code pipt nur stdout, stderr bleibt ggf. am TTY
+	if w, _, err := term.GetSize(int(os.Stderr.Fd())); err == nil && w > 0 {
+		return w
+	}
+
+	// 3. Controlling Terminal direkt abfragen — greift auch wenn stdout UND stderr
+	//    gepipet sind (Copilot CLI pipet beide). Muss vor `tput cols` stehen: tput
+	//    liefert ohne TTY still den terminfo-Default (meist 80) statt eines Fehlers.
+	if runtime.GOOS != "windows" {
 		if f, err := os.Open("/dev/tty"); err == nil {
 			defer f.Close()
 			if w, _, err := term.GetSize(int(f.Fd())); err == nil && w > 0 {
@@ -455,7 +557,24 @@ func getTerminalWidth() int {
 		}
 	}
 
-	// 3. Fallback
+	// 4. tput cols — funktioniert in Mintty/Git Bash wo Windows Console-APIs versagen
+	if out, err := exec.Command("tput", "cols").Output(); err == nil {
+		if w, err := strconv.Atoi(strings.TrimSpace(string(out))); err == nil && w > 0 {
+			return w
+		}
+	}
+
+	// 5. Windows Console-Handle als weiterer Fallback
+	if runtime.GOOS == "windows" {
+		if f, err := os.Open("CONOUT$"); err == nil {
+			defer f.Close()
+			if w, _, err := term.GetSize(int(f.Fd())); err == nil && w > 0 {
+				return w
+			}
+		}
+	}
+
+	// 6. Fallback
 	return 120
 }
 
@@ -518,51 +637,81 @@ func makeSep() string {
 
 const sepVisibleWidth = 5 // sichtbare Breite von "  •  "
 
-// renderLine1 rendert Zeile 1: Model + Context + Rate Limits
-func renderLine1(modelName string, currentTokens, contextSize int, usage UsageData, termWidth int) string {
+// trailingElement rendert ein Element rechts der Context-Anzeige
+type trailingElement func(budget int, showBars bool) string
+
+// line1Trailing liefert die flavor-spezifischen Elemente rechts der Context-Anzeige.
+// Claude Code: 5h + 7d Rate Limits. Copilot CLI: AIU-Verbrauch + geänderte Zeilen.
+// nil bedeutet, dass der Slot entfällt.
+func line1Trailing(s Statusline) (primary, secondary trailingElement) {
+	if s.Flavor == FlavorCopilot {
+		if s.AIU != "" {
+			primary = func(budget int, _ bool) string { return renderAIUElement(s.AIU, budget) }
+		}
+		secondary = func(_ int, _ bool) string { return renderLinesElement(s.LinesAdded, s.LinesRemoved) }
+		return
+	}
+
+	primary = func(budget int, showBars bool) string {
+		return renderRateLimitElement(s.Usage.FiveHourUtil, s.Usage.FiveHourReset, "5h", IconClock, budget, showBars, BrightMagenta)
+	}
+	if s.Usage.SevenDayUtil >= 0 {
+		secondary = func(budget int, showBars bool) string {
+			return renderRateLimitElement(s.Usage.SevenDayUtil, s.Usage.SevenDayReset, "7d", IconCalendar, budget, showBars, BrightYellow)
+		}
+	}
+	return
+}
+
+// renderLine1 rendert Zeile 1: Model + Context + Rate Limits bzw. AIU
+func renderLine1(s Statusline, termWidth int) string {
 	showBars := termWidth >= 100
 	sep := makeSep()
 
-	show7Day := termWidth >= 80 && usage.SevenDayUtil >= 0
+	primary, secondary := line1Trailing(s)
+	if termWidth < 80 {
+		secondary = nil
+	}
 
 	// Separator-Budget
-	numSeps := 2 // Model•Context•5h
-	if show7Day {
-		numSeps = 3
+	numSeps := 1 // Model•Context
+	if primary != nil {
+		numSeps++
+	}
+	if secondary != nil {
+		numSeps++
 	}
 
 	// Model bekommt was es braucht
-	modelStr := BrightMagenta + Bold + modelName + Reset
+	modelStr := BrightMagenta + Bold + s.ModelName + Reset
 	modelWidth := visibleWidth(modelStr)
 
 	available := termWidth - (numSeps * sepVisibleWidth) - modelWidth
 
 	// Budget aufteilen
-	var ctxBudget, fiveHBudget, sevenDBudget int
-	if show7Day {
+	var ctxBudget, primaryBudget, secondaryBudget int
+	switch {
+	case primary != nil && secondary != nil:
 		ctxBudget = available * 40 / 100
-		fiveHBudget = available * 30 / 100
-		sevenDBudget = available * 20 / 100
-		// Rundungsrest an Context
-		ctxBudget += available - ctxBudget - fiveHBudget - sevenDBudget
-	} else {
+		primaryBudget = available * 30 / 100
+		secondaryBudget = available * 20 / 100
+	case primary != nil:
 		ctxBudget = available * 55 / 100
-		fiveHBudget = available * 40 / 100
-		// Rundungsrest an Context
-		ctxBudget += available - ctxBudget - fiveHBudget
+		primaryBudget = available * 40 / 100
+	default:
+		ctxBudget = available
 	}
+	// Rundungsrest an Context
+	ctxBudget += available - ctxBudget - primaryBudget - secondaryBudget
 
 	parts := []string{modelStr}
-	parts = append(parts, renderContextElement(currentTokens, contextSize, ctxBudget, showBars))
+	parts = append(parts, renderContextElement(s.CurrentTokens, s.ContextSize, ctxBudget, showBars))
 
-	if usage.FiveHourUtil >= 0 {
-		parts = append(parts, renderRateLimitElement(usage.FiveHourUtil, usage.FiveHourReset, "5h", IconClock, fiveHBudget, showBars, BrightMagenta))
-	} else {
-		parts = append(parts, Dim+IconClock+" 5h: N/A"+Reset)
+	if primary != nil {
+		parts = append(parts, primary(primaryBudget, showBars))
 	}
-
-	if show7Day {
-		parts = append(parts, renderRateLimitElement(usage.SevenDayUtil, usage.SevenDayReset, "7d", IconCalendar, sevenDBudget, showBars, BrightYellow))
+	if secondary != nil {
+		parts = append(parts, secondary(secondaryBudget, showBars))
 	}
 
 	line := strings.Join(parts, sep)
@@ -621,8 +770,8 @@ func renderLine2(cwd string, gitData GitData, worktreeName string, termWidth int
 	return truncateToWidth(line, termWidth)
 }
 
-// renderLine3 rendert Zeile 3: System Stats + Session + Cost
-func renderLine3(cpuPct, memPct float64, sessionDur time.Duration, costUSD float64, termWidth int) string {
+// renderLine3 rendert Zeile 3: System Stats + Session + Cost bzw. API-Zeit
+func renderLine3(s Statusline, cpuPct, memPct float64, sessionDur time.Duration, termWidth int) string {
 	showBars := termWidth >= 100
 	sep := makeSep()
 
@@ -664,10 +813,16 @@ func renderLine3(cpuPct, memPct float64, sessionDur time.Duration, costUSD float
 		})
 	}
 
-	// Cost
-	if costUSD > 0 {
+	// Cost (Claude Code) bzw. API-Zeit (Copilot CLI kennt keine USD-Kosten)
+	if s.Flavor == FlavorCopilot {
+		if s.APIDuration > 0 {
+			parts = append(parts, lineElement{
+				fmt.Sprintf("%s %sAPI %s%s", IconClock, BrightYellow, formatAPIDuration(s.APIDuration), Reset),
+			})
+		}
+	} else if s.CostUSD > 0 {
 		parts = append(parts, lineElement{
-			fmt.Sprintf("%s %s$%.2f%s", IconCost, BrightYellow, costUSD, Reset),
+			fmt.Sprintf("%s %s$%.2f%s", IconCost, BrightYellow, s.CostUSD, Reset),
 		})
 	}
 
@@ -794,6 +949,25 @@ func renderRateLimitElement(pct int, resetTs int64, label, icon string, budget i
 		labelColor, icon, label, Reset,
 		color, pct, Reset,
 	)
+}
+
+// renderAIUElement rendert den AIU-Verbrauch (Copilot CLI)
+func renderAIUElement(formatted string, budget int) string {
+	labeled := fmt.Sprintf("%s%s AIU:%s %s", BrightYellow, IconAIU, Reset, formatted)
+	if visibleWidth(labeled) <= budget {
+		return labeled
+	}
+
+	// Minimal: "⚡ 1.2M"
+	return fmt.Sprintf("%s%s%s %s", BrightYellow, IconAIU, Reset, formatted)
+}
+
+// renderLinesElement rendert die geänderten Zeilen der Session (Copilot CLI)
+func renderLinesElement(added, removed int) string {
+	if added == 0 && removed == 0 {
+		return Dim + "+0/-0" + Reset
+	}
+	return fmt.Sprintf("%s+%d%s/%s-%d%s", BrightGreen, added, Reset, BrightRed, removed, Reset)
 }
 
 // renderGitElement rendert den Git-Status adaptiv
@@ -1078,6 +1252,14 @@ func formatSessionDuration(d time.Duration) string {
 		return fmt.Sprintf("%dh%dm", hours, minutes)
 	}
 	return fmt.Sprintf("%dm", minutes)
+}
+
+// formatAPIDuration formatiert die API-Zeit; unter einer Minute in Sekunden
+func formatAPIDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	return formatSessionDuration(d)
 }
 
 // renderMiniBar rendert eine kompakte Progress-Bar

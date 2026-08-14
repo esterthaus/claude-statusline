@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Cross-platform CLI statusline renderer for Claude Code. Single Go binary that reads JSON from stdin (provided by Claude Code CLI) and outputs 3 ANSI-colored lines to stdout showing model info, context usage, rate limits, git status, system stats, session duration, and cost.
+Cross-platform CLI statusline renderer for Claude Code **and GitHub Copilot CLI**. Single Go binary that reads JSON from stdin (provided by the host CLI) and outputs 3 ANSI-colored lines to stdout showing model info, context usage, rate limits/AIU, git status, system stats, session duration, and cost.
 
 ## Build & Run Commands
 
@@ -20,29 +20,33 @@ Build uses `go build -ldflags="-s -w"` for stripped, size-optimized binaries. No
 
 ## Architecture
 
-**Single-file application** (`main.go`, ~550 lines). No packages, no modules beyond main.
+**Single-file application** (`main.go`, ~1250 lines). No packages, no modules beyond main.
 
 ### Data Flow
 
 ```
-stdin JSON → parse StatusLineInput → fetch external data in parallel → render 3 lines → stdout
+stdin JSON → parse StatusLineInput → normalize() → Statusline → fetch external data → render 3 lines → stdout
 ```
+
+`StatusLineInput` is a superset of both JSON dialects. `detectFlavor()` picks the flavor from
+Copilot-only fields (`remote`, `ai_used`, `context_window.current_context_tokens`), and `normalize()`
+maps it to the flavor-independent `Statusline` struct that all render functions consume.
 
 ### Three Output Lines
 
-1. **Model + Context + Usage**: Model name, context window progress bar (tokens, uses native `used_percentage`), 5h/7d rate limits with reset times (from native `rate_limits` JSON)
-2. **Workspace + Git + Worktree**: Shortened CWD, git status (changes, staged, stash, unpushed, unpulled), worktree name if active
-3. **System + Session + Cost**: CPU/RAM mini progress bars, session duration, session cost in USD
+1. **Model + Context + Usage**: Model name, context window progress bar, then two flavor-specific slots — Claude Code: 5h/7d rate limits with reset times (`rate_limits`); Copilot: AIU consumption (`ai_used.formatted`) + session lines added/removed
+2. **Workspace + Git + Worktree**: Shortened CWD, git status (changes, staged, stash, unpushed, unpulled), worktree name if active (Claude Code only)
+3. **System + Session + Cost**: CPU/RAM mini progress bars, session duration, then session cost in USD (Claude Code) or API time (Copilot, which has no USD cost)
 
 ### Data Sources
 
-All model, context, rate limit, cost, and worktree data comes from Claude Code's native stdin JSON. External sources:
+All model, context, rate limit, AIU, cost, and worktree data comes from the host CLI's native stdin JSON. External sources:
 
 | Source | Function | Notes |
 |--------|----------|-------|
 | Git CLI commands | `getGitStatus()` | Uses `--no-optional-locks` and `core.useBuiltinFSMonitor=false` flags |
 | gopsutil library | `getSystemStats()` | CPU (100ms sample) and RAM percentage |
-| Parent process | `getSessionDuration()` | Session duration from parent process creation time |
+| Parent process | `getSessionDuration()` | Session duration from parent process creation time (Claude Code; Copilot uses `cost.total_duration_ms`) |
 
 ### Key Conventions
 
@@ -51,13 +55,31 @@ All model, context, rate limit, cost, and worktree data comes from Claude Code's
 - Graceful degradation: missing credentials → "N/A", no git repo → "N/A", API timeout → cached/N/A
 - `renderProgressBar()` for usage bars, `renderMiniBar()` for compact system stats
 
+### Copilot Context Window Gotcha
+
+Copilot's `context_window` exposes two different views, and only one of them is usable for a statusline:
+
+- **Raw view** (`used_percentage`, `remaining_percentage`, `last_call_*`) covers **only the last API call**
+  against the full model window. It jumps around erratically and must not be shown as context usage.
+- **Display view** (`current_context_tokens`, `displayed_context_limit`, `current_context_used_percentage`)
+  is what Copilot's own `/context` shows. `copilotContext()` uses this one.
+
+`displayed_context_limit` and `current_context_used_percentage` are **absent** (not zero) when not > 0,
+and several other fields are nullable — hence the pointer types in `StatusLineInput`. Without a limit the
+context element degrades to "Ctx: N/A" rather than guessing a window size.
+
+Percentages are recomputed from tokens via integer division, so the value can read 1% lower than
+Copilot's own rounded display (e.g. 25% vs 26%). This matches how the Claude Code path already behaves.
+
 ## Dependencies
 
 Only one external dependency: `github.com/shirou/gopsutil/v3` for CPU/memory stats. Everything else uses Go stdlib.
 
 ## Integration
 
-Binary is configured in `~/.claude/settings.json`:
+### Claude Code
+
+Binary is configured in `~/.claude/settings.json` (`make install`):
 ```json
 {
   "statusLine": {
@@ -66,6 +88,54 @@ Binary is configured in `~/.claude/settings.json`:
   }
 }
 ```
+
+### GitHub Copilot CLI
+
+Same binary, installed as `~/.copilot/statusline` via `make install-copilot`, configured in
+`~/.copilot/settings.json`. Verified against CLI **1.0.80** by reading the bundle
+(`~/.cache/copilot/pkg/<platform>/<version>/app.js`, functions `Hxi`/`Gxi`):
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.copilot/statusline"
+  }
+}
+```
+
+Contract, as implemented in 1.0.80 — worth knowing because it differs from Claude Code:
+
+| Aspect | Behavior |
+|--------|----------|
+| `type` | Optional; if present must be `"command"` |
+| `command` | Expands `~`, `$VAR`, `${VAR:-default}`. **Relative paths containing `/` resolve against the session cwd, not `~/.copilot`** — use `~/` or an absolute path |
+| `padding` | Spaces prepended to *each* line (default 0). Leave at 0: the renderer already uses the full terminal width, so padding causes overflow |
+| `refreshInterval` | Integer seconds (1–2147483). Omitted = refresh on events only |
+| Multi-line | Supported — output is split on `\n`, padded per line, rejoined. No line limit in the code |
+| Timeout | **10 s hard**, then SIGTERM/SIGKILL. This binary needs ~0.6 s |
+| Exit code | Must be 0, otherwise the CLI surfaces the error and stderr |
+| stdin | JSON without trailing newline; read to EOF |
+| stdio | stdout **and stderr are piped**, so `term.GetSize(stderr)` fails — see the width gotcha below |
+
+Copilot has no experimental flag for this any more; `STATUS_LINE` does not appear in the 1.0.80 bundle.
+On Windows the installed name is `statusline.exe` — adjust `command` accordingly and mind the path gotcha below.
+
+### `tput cols` Width Gotcha
+
+**`tput cols` returns the terminfo default (usually 80) instead of an error when stdout is not a TTY.**
+Because it "succeeds", it swallows every later probe in `getTerminalWidth()`. Claude Code leaves stderr
+on the TTY so step 2 wins there, but Copilot pipes stdout *and* stderr — so every statusline rendered
+under Copilot was stuck at 80 columns (no progress bars, compact CPU/RAM) regardless of real width.
+
+Fix: probe `/dev/tty` **before** `tput cols` on Unix. `/dev/tty` is the controlling terminal and reports
+the true size no matter which streams are piped. `tput` stays as the fallback for Mintty/Git Bash, where
+the Windows console APIs fail; on Windows the `CONOUT$` probe keeps its original position after `tput`.
+
+Order matters — do not reshuffle without re-testing. Verify with a pseudoterminal harness (pty of known
+width as controlling terminal, stdout/stderr piped), not from a normal shell: a plain terminal has stderr
+on the TTY and so never exercises this path. `$TMPDIR/statusline-debug.log` records every probe's result
+(`stderrW`, `ttyW`, `tput`) for the last invocation.
 
 ### Windows Path Gotcha
 

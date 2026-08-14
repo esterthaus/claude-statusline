@@ -1,4 +1,4 @@
-.PHONY: build build-all clean test install
+.PHONY: build build-all clean test install install-copilot
 
 BINARY_NAME=claude-statusline
 VERSION?=1.0.0
@@ -36,4 +36,13 @@ ifeq ($(OS),Windows_NT)
 else
 	cp $(BINARY_NAME) ~/.claude/$(BINARY_NAME)
 	chmod +x ~/.claude/$(BINARY_NAME)
+endif
+
+# Installiere in ~/.copilot/ (GitHub Copilot CLI)
+install-copilot: build
+ifeq ($(OS),Windows_NT)
+	copy $(BINARY_NAME).exe "$(USERPROFILE)\.copilot\statusline.exe"
+else
+	cp $(BINARY_NAME) ~/.copilot/statusline
+	chmod +x ~/.copilot/statusline
 endif
