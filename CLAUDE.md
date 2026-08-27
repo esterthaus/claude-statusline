@@ -20,7 +20,7 @@ Build uses `go build -ldflags="-s -w"` for stripped, size-optimized binaries. No
 
 ## Architecture
 
-**Single-file application** (`main.go`, ~1250 lines). No packages, no modules beyond main.
+**Single-file application** (`main.go`, ~1450 lines). No packages, no modules beyond main.
 
 ### Data Flow
 
@@ -34,25 +34,47 @@ maps it to the flavor-independent `Statusline` struct that all render functions 
 
 ### Three Output Lines
 
-1. **Model + Context + Usage**: Model name, context window progress bar, then two flavor-specific slots — Claude Code: 5h/7d rate limits with reset times (`rate_limits`); Copilot: AIU consumption (`ai_used.formatted`) + session lines added/removed
+1. **Model + Context + Usage**: Model name, context window progress bar, then flavor-specific trailing elements — Claude Code: 5h/7d rate limits with reset times (`rate_limits`) plus one element per model-specific weekly limit (e.g. `Fable`, fetched from the OAuth usage endpoint, see below); Copilot: AIU consumption (`ai_used.formatted`) + session lines added/removed. Elements are dropped from the right as the terminal narrows (`termWidth/40` elements max: <80 → 1, <120 → 2, ≥120 → 3)
 2. **Workspace + Git + Worktree**: Shortened CWD, git status (changes, staged, stash, unpushed, unpulled), worktree name if active (Claude Code only)
 3. **System + Session + Cost**: CPU/RAM mini progress bars, session duration, then session cost in USD (Claude Code) or API time (Copilot, which has no USD cost)
 
 ### Data Sources
 
-All model, context, rate limit, AIU, cost, and worktree data comes from the host CLI's native stdin JSON. External sources:
+All model, context, 5h/7d rate limit, AIU, cost, and worktree data comes from the host CLI's native stdin JSON. External sources:
 
 | Source | Function | Notes |
 |--------|----------|-------|
-| Git CLI commands | `getGitStatus()` | Uses `--no-optional-locks` and `core.useBuiltinFSMonitor=false` flags |
+| Git CLI commands | `getGitData()` | Uses `--no-optional-locks` and `core.useBuiltinFSMonitor=false` flags |
 | gopsutil library | `getSystemStats()` | CPU (100ms sample) and RAM percentage |
 | Parent process | `getSessionDuration()` | Session duration from parent process creation time (Claude Code; Copilot uses `cost.total_duration_ms`) |
+| Anthropic OAuth usage endpoint | `fetchScopedLimits()` | Model-specific weekly limits (e.g. Fable). Claude Code flavor only, and only when stdin has `rate_limits` (subscription session). Runs in a goroutine parallel to git/sysstats |
+
+### Usage Endpoint (model-specific weekly limits)
+
+Claude Code's `/usage` dialog shows a per-model weekly limit ("Current week (Fable)"), but the statusline stdin JSON
+does **not** carry it — `rate_limits` is built from the header-based in-memory state and only ever has `five_hour`
+and `seven_day` (verified against the 2.1.247 bundle; the statusline JSON has no other undocumented fields apart from
+`remote.session_id` in `--remote` mode). The dialog uses a different path, which this binary calls itself:
+
+- `GET https://api.anthropic.com/api/oauth/usage` with `Authorization: Bearer <accessToken>`,
+  `Content-Type: application/json`, `anthropic-beta: oauth-2025-04-20`. **Undocumented API**, reverse-engineered from
+  Claude Code 2.1.247 — may change without notice. Claude Code itself uses a 5 s timeout; we use 3 s.
+- Token comes from `$CLAUDE_CONFIG_DIR/.credentials.json` (default `~/.claude/`), field `claudeAiOauth.accessToken`.
+  An expired token (`expiresAt`, ms) is treated as an error. The **refresh token is never used** — Claude Code rotates
+  it itself and a foreign refresh would break its session. macOS Keychain is not read, so the element is simply absent there.
+- Only `limits[]` entries with `kind == "weekly_scoped"` and a `scope.model.display_name` are used; the name becomes
+  the label (`📅 Fable: 6% 09:59`, rendered via `renderRateLimitElement()` with the usual traffic-light colors).
+- Cache: `$TMPDIR/statusline-usage-cache.json` (`fetched_at`, `checked_at`, raw `body`), written atomically via
+  temp file + rename because the statusline runs every few hundred ms while streaming and the endpoint returns 429 when
+  polled too often. TTL 60 s (`checked_at`, also bumped after failures → backoff); on failure data up to 15 min old
+  (`fetched_at`) is still shown, otherwise the element is dropped. Never prints to stdout, never exits non-zero.
+- `$TMPDIR/statusline-debug.log` gets a `usage=<cache|network|stale: …|none: …|skipped> scoped=<n>` line per run.
 
 ### Key Conventions
 
 - All comments and git status labels are in **German** (e.g., "Änderungen", "Sekunden")
 - Traffic light color scheme via `getColorForPercentage()`: green (0-30%) → amber (50-70%) → red (85%+)
-- Graceful degradation: missing credentials → "N/A", no git repo → "N/A", API timeout → cached/N/A
+- Graceful degradation: no git repo → "N/A", missing rate limit → "N/A", usage-endpoint failure → stale cache (≤15 min) or element dropped
 - `renderProgressBar()` for usage bars, `renderMiniBar()` for compact system stats
 
 ### Copilot Context Window Gotcha

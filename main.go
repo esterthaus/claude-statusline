@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -125,12 +127,20 @@ type StatusLineInput struct {
 	Exceeds200kTokens bool             `json:"exceeds_200k_tokens"`
 }
 
+// ScopedLimit ist ein modellspezifisches Wochenlimit aus dem OAuth-Usage-Endpoint
+type ScopedLimit struct {
+	Name  string // scope.model.display_name, z.B. "Fable"
+	Util  int    // Prozent
+	Reset int64  // Unix-Sekunden, 0 = unbekannt
+}
+
 // UsageData fuer Rate-Limit-Anzeige
 type UsageData struct {
-	FiveHourUtil   int
-	SevenDayUtil   int
-	FiveHourReset  int64
-	SevenDayReset  int64
+	FiveHourUtil  int
+	SevenDayUtil  int
+	FiveHourReset int64
+	SevenDayReset int64
+	Scoped        []ScopedLimit // per Netz nachgeladen, nicht im stdin-JSON (0..n)
 }
 
 // Flavor unterscheidet die CLI, die das JSON geliefert hat
@@ -261,6 +271,170 @@ func extractRateLimits(in StatusLineInput) UsageData {
 	return usage
 }
 
+// --- Modellspezifische Wochenlimits (OAuth-Usage-Endpoint) ---
+
+const (
+	usageEndpoint     = "https://api.anthropic.com/api/oauth/usage"
+	usageCacheFile    = "statusline-usage-cache.json" // in os.TempDir()
+	usageCacheTTL     = 60 * time.Second              // Mindestabstand zwischen Requests
+	usageCacheStale   = 15 * time.Minute              // max. Alter, bis zu dem alte Daten noch angezeigt werden
+	usageFetchTimeout = 3 * time.Second
+)
+
+// usageCache speichert die rohe Antwort des Usage-Endpoints. checked_at bremst auch nach
+// Fehlern (429, offline), fetched_at begrenzt, wie lange veraltete Daten noch angezeigt werden.
+type usageCache struct {
+	FetchedAt int64           `json:"fetched_at"`
+	CheckedAt int64           `json:"checked_at"`
+	Body      json.RawMessage `json:"body"`
+}
+
+func usageCachePath() string { return filepath.Join(os.TempDir(), usageCacheFile) }
+
+func loadUsageCache() (usageCache, bool) {
+	var c usageCache
+	data, err := os.ReadFile(usageCachePath())
+	if err != nil || json.Unmarshal(data, &c) != nil {
+		return usageCache{}, false
+	}
+	return c, true
+}
+
+// saveUsageCache schreibt atomar (Temp-Datei + Rename), damit parallele Aufrufe nie eine halbe Datei lesen
+func saveUsageCache(c usageCache) {
+	data, err := json.Marshal(c)
+	if err != nil {
+		return
+	}
+	f, err := os.CreateTemp(os.TempDir(), "statusline-usage-cache-*.tmp")
+	if err != nil {
+		return
+	}
+	_, werr := f.Write(data)
+	cerr := f.Close()
+	if werr != nil || cerr != nil || os.Rename(f.Name(), usageCachePath()) != nil {
+		os.Remove(f.Name())
+	}
+}
+
+// readOAuthToken liest das Access-Token aus ~/.claude/.credentials.json. Der Refresh-Token wird
+// bewusst nie benutzt: Claude Code rotiert ihn selbst, ein Fremd-Refresh würde die Session stören.
+func readOAuthToken() (string, error) {
+	dir := os.Getenv("CLAUDE_CONFIG_DIR")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		dir = filepath.Join(home, ".claude")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, ".credentials.json"))
+	if err != nil {
+		return "", err
+	}
+	var creds struct {
+		ClaudeAiOauth struct {
+			AccessToken string `json:"accessToken"`
+			ExpiresAt   int64  `json:"expiresAt"` // Millisekunden
+		} `json:"claudeAiOauth"`
+	}
+	if err := json.Unmarshal(data, &creds); err != nil {
+		return "", err
+	}
+	tok := creds.ClaudeAiOauth.AccessToken
+	if tok == "" {
+		return "", fmt.Errorf("kein OAuth-Token")
+	}
+	if exp := creds.ClaudeAiOauth.ExpiresAt; exp > 0 && time.Now().UnixMilli() >= exp {
+		return "", fmt.Errorf("OAuth-Token abgelaufen")
+	}
+	return tok, nil
+}
+
+// parseScopedLimits filtert aus limits[] die modellspezifischen Wochenlimits (kind == weekly_scoped)
+func parseScopedLimits(body []byte) []ScopedLimit {
+	var r struct {
+		Limits []struct {
+			Kind     string  `json:"kind"`
+			Percent  float64 `json:"percent"`
+			ResetsAt string  `json:"resets_at"`
+			Scope    *struct {
+				Model *struct {
+					DisplayName string `json:"display_name"`
+				} `json:"model"`
+			} `json:"scope"`
+		} `json:"limits"`
+	}
+	if json.Unmarshal(body, &r) != nil {
+		return nil
+	}
+	var limits []ScopedLimit
+	for _, l := range r.Limits {
+		if l.Kind != "weekly_scoped" || l.Scope == nil || l.Scope.Model == nil || l.Scope.Model.DisplayName == "" {
+			continue
+		}
+		sl := ScopedLimit{Name: l.Scope.Model.DisplayName, Util: int(l.Percent)}
+		if t, err := time.Parse(time.RFC3339, l.ResetsAt); err == nil {
+			sl.Reset = t.Unix()
+		}
+		limits = append(limits, sl)
+	}
+	return limits
+}
+
+// fetchUsage holt die rohe Antwort des Usage-Endpoints
+func fetchUsage(token string) ([]byte, error) {
+	req, err := http.NewRequest("GET", usageEndpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	resp, err := (&http.Client{Timeout: usageFetchTimeout}).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("http %d", resp.StatusCode)
+	}
+	return body, nil
+}
+
+// fetchScopedLimits liefert die modellspezifischen Wochenlimits (z.B. "Fable"), die Claude Code
+// nicht im Statusline-JSON mitgibt. Cache in os.TempDir(), nie stdout, Fehler → leere Liste.
+// note beschreibt die Quelle fürs Debug-Log: "cache", "network", "stale: …", "none: …".
+func fetchScopedLimits() (limits []ScopedLimit, note string) {
+	now := time.Now()
+	c, ok := loadUsageCache()
+	if ok && now.Sub(time.Unix(c.CheckedAt, 0)) < usageCacheTTL {
+		return parseScopedLimits(c.Body), "cache"
+	}
+
+	var body []byte
+	token, err := readOAuthToken()
+	if err == nil {
+		body, err = fetchUsage(token)
+	}
+	if err == nil {
+		saveUsageCache(usageCache{FetchedAt: now.Unix(), CheckedAt: now.Unix(), Body: body})
+		return parseScopedLimits(body), "network"
+	}
+
+	// Fehler: Versuch merken (Backoff für eine TTL), ggf. veraltete Daten weiterverwenden
+	c.CheckedAt = now.Unix()
+	saveUsageCache(c)
+	if now.Sub(time.Unix(c.FetchedAt, 0)) < usageCacheStale {
+		return parseScopedLimits(c.Body), "stale: " + err.Error()
+	}
+	return nil, "none: " + err.Error()
+}
+
 func main() {
 	// JSON von stdin lesen
 	reader := bufio.NewReader(os.Stdin)
@@ -283,6 +457,19 @@ func main() {
 
 	// Daten normalisieren (Claude Code oder Copilot CLI)
 	s := normalize(input)
+
+	// Modellspezifische Wochenlimits parallel nachladen (nur Claude Code mit Abo-Session)
+	var scoped []ScopedLimit
+	usageNote := "skipped"
+	scopedDone := make(chan struct{})
+	if s.Flavor == FlavorClaude && input.RateLimits != nil {
+		go func() {
+			scoped, usageNote = fetchScopedLimits()
+			close(scopedDone)
+		}()
+	} else {
+		close(scopedDone)
+	}
 
 	// Terminalbreite ermitteln
 	termWidth := getTerminalWidth()
@@ -317,6 +504,13 @@ func main() {
 	sessionDur := s.SessionDur
 	if sessionDur == 0 {
 		sessionDur = getSessionDuration()
+	}
+
+	<-scopedDone
+	s.Usage.Scoped = scoped
+	if f, err := os.OpenFile(filepath.Join(os.TempDir(), "statusline-debug.log"), os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+		fmt.Fprintf(f, "usage=%s scoped=%d\n", usageNote, len(scoped))
+		f.Close()
 	}
 
 	// 3 Zeilen rendern
@@ -640,27 +834,32 @@ const sepVisibleWidth = 5 // sichtbare Breite von "  •  "
 // trailingElement rendert ein Element rechts der Context-Anzeige
 type trailingElement func(budget int, showBars bool) string
 
-// line1Trailing liefert die flavor-spezifischen Elemente rechts der Context-Anzeige.
-// Claude Code: 5h + 7d Rate Limits. Copilot CLI: AIU-Verbrauch + geänderte Zeilen.
-// nil bedeutet, dass der Slot entfällt.
-func line1Trailing(s Statusline) (primary, secondary trailingElement) {
+// line1Trailing liefert die flavor-spezifischen Elemente rechts der Context-Anzeige, in Anzeigereihenfolge.
+// Claude Code: 5h, 7d, dann modellspezifische Wochenlimits (z.B. Fable). Copilot CLI: AIU-Verbrauch + geänderte Zeilen.
+func line1Trailing(s Statusline) []trailingElement {
+	var elems []trailingElement
 	if s.Flavor == FlavorCopilot {
 		if s.AIU != "" {
-			primary = func(budget int, _ bool) string { return renderAIUElement(s.AIU, budget) }
+			elems = append(elems, func(budget int, _ bool) string { return renderAIUElement(s.AIU, budget) })
 		}
-		secondary = func(_ int, _ bool) string { return renderLinesElement(s.LinesAdded, s.LinesRemoved) }
-		return
+		elems = append(elems, func(_ int, _ bool) string { return renderLinesElement(s.LinesAdded, s.LinesRemoved) })
+		return elems
 	}
 
-	primary = func(budget int, showBars bool) string {
+	elems = append(elems, func(budget int, showBars bool) string {
 		return renderRateLimitElement(s.Usage.FiveHourUtil, s.Usage.FiveHourReset, "5h", IconClock, budget, showBars, BrightMagenta)
-	}
+	})
 	if s.Usage.SevenDayUtil >= 0 {
-		secondary = func(budget int, showBars bool) string {
+		elems = append(elems, func(budget int, showBars bool) string {
 			return renderRateLimitElement(s.Usage.SevenDayUtil, s.Usage.SevenDayReset, "7d", IconCalendar, budget, showBars, BrightYellow)
-		}
+		})
 	}
-	return
+	for _, sl := range s.Usage.Scoped {
+		elems = append(elems, func(budget int, showBars bool) string {
+			return renderRateLimitElement(sl.Util, sl.Reset, sl.Name, IconCalendar, budget, showBars, Cyan)
+		})
+	}
+	return elems
 }
 
 // renderLine1 rendert Zeile 1: Model + Context + Rate Limits bzw. AIU
@@ -668,54 +867,57 @@ func renderLine1(s Statusline, termWidth int) string {
 	showBars := termWidth >= 100
 	sep := makeSep()
 
-	primary, secondary := line1Trailing(s)
-	if termWidth < 80 {
-		secondary = nil
-	}
-
-	// Separator-Budget
-	numSeps := 1 // Model•Context
-	if primary != nil {
-		numSeps++
-	}
-	if secondary != nil {
-		numSeps++
+	// Breitenregel: <80 nur das erste Element, <120 höchstens zwei, ab 120 drei, ...
+	elems := line1Trailing(s)
+	maxElems := max(1, termWidth/40)
+	if len(elems) > maxElems {
+		elems = elems[:maxElems]
 	}
 
 	// Model bekommt was es braucht
 	modelStr := BrightMagenta + Bold + s.ModelName + Reset
 	modelWidth := visibleWidth(modelStr)
 
+	numSeps := 1 + len(elems) // Model•Context + je ein Separator pro Element
 	available := termWidth - (numSeps * sepVisibleWidth) - modelWidth
-
-	// Budget aufteilen
-	var ctxBudget, primaryBudget, secondaryBudget int
-	switch {
-	case primary != nil && secondary != nil:
-		ctxBudget = available * 40 / 100
-		primaryBudget = available * 30 / 100
-		secondaryBudget = available * 20 / 100
-	case primary != nil:
-		ctxBudget = available * 55 / 100
-		primaryBudget = available * 40 / 100
-	default:
-		ctxBudget = available
-	}
-	// Rundungsrest an Context
-	ctxBudget += available - ctxBudget - primaryBudget - secondaryBudget
+	ctxBudget, budgets := splitLine1Budget(available, len(elems))
 
 	parts := []string{modelStr}
 	parts = append(parts, renderContextElement(s.CurrentTokens, s.ContextSize, ctxBudget, showBars))
-
-	if primary != nil {
-		parts = append(parts, primary(primaryBudget, showBars))
-	}
-	if secondary != nil {
-		parts = append(parts, secondary(secondaryBudget, showBars))
+	for i, el := range elems {
+		parts = append(parts, el(budgets[i], showBars))
 	}
 
 	line := strings.Join(parts, sep)
 	return truncateToWidth(line, termWidth)
+}
+
+// splitLine1Budget verteilt die verfügbare Breite auf Context + n Trailing-Elemente.
+// 0/1/2 Elemente behalten die bisherigen Anteile (100 | 55/40 | 40/30/20), ab 3 gilt
+// Gewichtung Context 4 : erstes Element 3 : weitere je 2. Rundungsrest geht an Context.
+func splitLine1Budget(available, n int) (ctx int, elems []int) {
+	elems = make([]int, n)
+	switch n {
+	case 0:
+		ctx = available
+	case 1:
+		ctx, elems[0] = available*55/100, available*40/100
+	case 2:
+		ctx, elems[0], elems[1] = available*40/100, available*30/100, available*20/100
+	default:
+		total := 4 + 3 + 2*(n-1)
+		ctx = available * 4 / total
+		elems[0] = available * 3 / total
+		for i := 1; i < n; i++ {
+			elems[i] = available * 2 / total
+		}
+	}
+	used := ctx
+	for _, b := range elems {
+		used += b
+	}
+	ctx += available - used
+	return
 }
 
 // renderLine2 rendert Zeile 2: CWD + Git + Worktree

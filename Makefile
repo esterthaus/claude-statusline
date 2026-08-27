@@ -27,7 +27,7 @@ clean:
 	rm -rf dist/
 
 test:
-	@echo '{"context_window":{"current_usage":{"input_tokens":50000,"cache_creation_input_tokens":10000,"cache_read_input_tokens":5000},"total_input_tokens":65000,"total_output_tokens":8000,"context_window_size":200000,"used_percentage":32,"remaining_percentage":68},"model":{"id":"claude-opus-4-6","display_name":"Claude Opus 4.5"},"workspace":{"current_dir":"C:/Users/test","project_dir":"C:/Users/test/project"},"rate_limits":{"five_hour":{"used_percentage":42,"resets_at":"2026-03-20T15:00:00Z"},"seven_day":{"used_percentage":18,"resets_at":"2026-03-23T07:00:00Z"}},"cost":{"total_cost_usd":0.1234,"total_duration_ms":45000,"total_api_duration_ms":2300,"total_lines_added":156,"total_lines_removed":23},"version":"1.0.80"}' | ./$(BINARY_NAME)$(if $(findstring windows,$(shell go env GOOS)),.exe,)
+	@echo '{"context_window":{"current_usage":{"input_tokens":50000,"cache_creation_input_tokens":10000,"cache_read_input_tokens":5000},"total_input_tokens":65000,"total_output_tokens":8000,"context_window_size":200000,"used_percentage":32,"remaining_percentage":68},"model":{"id":"claude-opus-4-6","display_name":"Claude Opus 4.5"},"workspace":{"current_dir":"C:/Users/test","project_dir":"C:/Users/test/project"},"rate_limits":{"five_hour":{"used_percentage":42,"resets_at":1774018800},"seven_day":{"used_percentage":18,"resets_at":1774249200}},"cost":{"total_cost_usd":0.1234,"total_duration_ms":45000,"total_api_duration_ms":2300,"total_lines_added":156,"total_lines_removed":23},"version":"1.0.80"}' | ./$(BINARY_NAME)$(if $(findstring windows,$(shell go env GOOS)),.exe,)
 
 # Installiere in ~/.claude/
 install: build
