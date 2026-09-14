@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -56,6 +57,7 @@ const (
 	IconCost     = "💰"
 	IconWorktree = "🌿"
 	IconAIU      = "⚡"
+	IconCache    = "🧊"
 )
 
 // Input JSON Struktur (von Claude Code bzw. Copilot CLI)
@@ -122,6 +124,7 @@ type StatusLineInput struct {
 	// Copilot CLI: nur als Erkennungsmerkmal, der Inhalt wird nicht ausgewertet
 	Remote            *json.RawMessage `json:"remote"`
 	Version           string           `json:"version"`
+	TranscriptPath    string           `json:"transcript_path"`
 	SessionID         string           `json:"session_id"`
 	Cwd               string           `json:"cwd"`
 	Exceeds200kTokens bool             `json:"exceeds_200k_tokens"`
@@ -143,6 +146,12 @@ type UsageData struct {
 	Scoped        []ScopedLimit // per Netz nachgeladen, nicht im stdin-JSON (0..n)
 }
 
+// CacheInfo beschreibt den Prompt-Cache der laufenden Konversation
+type CacheInfo struct {
+	ExpiresAt time.Time // Ablauf der Cache-TTL, Nullwert = unbekannt
+	HitPct    int       // Trefferquote des letzten API-Calls, -1 = unbekannt
+}
+
 // Flavor unterscheidet die CLI, die das JSON geliefert hat
 type Flavor int
 
@@ -160,6 +169,7 @@ type Statusline struct {
 	ContextSize   int
 
 	// Nur Claude Code
+	Cache        CacheInfo
 	Usage        UsageData
 	WorktreeName string
 	CostUSD      float64
@@ -182,7 +192,7 @@ func detectFlavor(in StatusLineInput) Flavor {
 
 // normalize überführt das Eingabe-JSON in die flavor-unabhängige Anzeigestruktur
 func normalize(in StatusLineInput) Statusline {
-	s := Statusline{Flavor: detectFlavor(in)}
+	s := Statusline{Flavor: detectFlavor(in), Cache: CacheInfo{HitPct: -1}}
 
 	s.ModelName = in.Model.DisplayName
 	if s.ModelName == "" {
@@ -214,6 +224,7 @@ func normalize(in StatusLineInput) Statusline {
 	}
 
 	s.CurrentTokens, s.ContextSize = claudeContext(in)
+	s.Cache.HitPct = cacheHitPct(in)
 	s.Usage = extractRateLimits(in)
 	if in.Worktree != nil {
 		s.WorktreeName = in.Worktree.Name
@@ -252,6 +263,114 @@ func copilotContext(in StatusLineInput) (tokens, size int) {
 		size = cw.ContextWindowSize
 	}
 	return
+}
+
+// Prompt-Cache: das Transcript wird nur am Ende gelesen, die Statuszeile laeuft im Sekundentakt
+const transcriptTailBytes = 256 * 1024
+
+// transcriptEntry ist der Ausschnitt einer Transcript-Zeile, den die Cache-Berechnung braucht
+type transcriptEntry struct {
+	Type        string `json:"type"`
+	IsSidechain bool   `json:"isSidechain"`
+	Timestamp   string `json:"timestamp"`
+	Message     struct {
+		Usage *struct {
+			CacheCreation *struct {
+				Ephemeral5m int `json:"ephemeral_5m_input_tokens"`
+				Ephemeral1h int `json:"ephemeral_1h_input_tokens"`
+			} `json:"cache_creation"`
+		} `json:"usage"`
+	} `json:"message"`
+}
+
+// cacheHitPct ist der Anteil der Prompt-Tokens des letzten API-Calls, der aus dem Cache kam.
+// Faellt nach einer Kompaktierung oder abgelaufenem Cache sofort ab. -1 = unbekannt.
+func cacheHitPct(in StatusLineInput) int {
+	cu := in.ContextWindow.CurrentUsage
+	if cu == nil {
+		return -1
+	}
+	total := cu.InputTokens + cu.CacheCreationInputTokens + cu.CacheReadInputTokens
+	if total <= 0 {
+		return -1
+	}
+	return cu.CacheReadInputTokens * 100 / total
+}
+
+// tailLines liest die letzten max Bytes einer Datei als Zeilen. Die erste Zeile wird verworfen,
+// wenn nicht von Dateianfang an gelesen wurde - sie ist dann angeschnitten.
+func tailLines(path string, max int64) ([][]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	var off int64
+	if st.Size() > max {
+		off = st.Size() - max
+	}
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+	lines := bytes.Split(data, []byte("\n"))
+	if off > 0 && len(lines) > 0 {
+		lines = lines[1:]
+	}
+	return lines, nil
+}
+
+// readCacheExpiry bestimmt, wie lange der Prompt-Cache der Konversation noch warm ist.
+// Zeitanker ist der letzte API-Call der Hauptkonversation (Sidechains der Subagenten haben
+// eigene Caches und zaehlen nicht), denn jeder Cache-Treffer erneuert die TTL. Die TTL selbst
+// steht in cache_creation des juengsten Calls, der ueberhaupt etwas geschrieben hat:
+// ephemeral_1h_input_tokens > 0 bedeutet 1 h, ephemeral_5m_input_tokens > 0 bedeutet 5 min.
+// Ohne ermittelbare TTL bleibt der Rueckgabewert leer - lieber kein Element als eine geratene Zahl.
+// note beschreibt das Ergebnis fuers Debug-Log.
+func readCacheExpiry(path string) (time.Time, string) {
+	if path == "" {
+		return time.Time{}, "no path"
+	}
+	lines, err := tailLines(path, transcriptTailBytes)
+	if err != nil {
+		return time.Time{}, "err: " + err.Error()
+	}
+
+	var last time.Time
+	for i := len(lines) - 1; i >= 0; i-- {
+		var e transcriptEntry
+		if json.Unmarshal(lines[i], &e) != nil {
+			continue
+		}
+		if e.Type != "assistant" || e.IsSidechain || e.Message.Usage == nil {
+			continue
+		}
+		if last.IsZero() {
+			ts, terr := time.Parse(time.RFC3339, e.Timestamp)
+			if terr != nil {
+				continue
+			}
+			last = ts
+		}
+		cc := e.Message.Usage.CacheCreation
+		if cc == nil {
+			continue
+		}
+		if cc.Ephemeral1h > 0 {
+			return last.Add(time.Hour), "1h"
+		}
+		if cc.Ephemeral5m > 0 {
+			return last.Add(5 * time.Minute), "5m"
+		}
+	}
+	return time.Time{}, "no ttl"
 }
 
 // extractRateLimits liest die Rate Limits, -1 markiert fehlende Werte
@@ -501,6 +620,10 @@ func main() {
 	// Externe Daten holen
 	gitData := getGitData(resolveWorkDir(s.Cwd))
 	cpuPercent, memPercent := getSystemStats()
+	cacheNote := "skipped"
+	if s.Flavor == FlavorClaude {
+		s.Cache.ExpiresAt, cacheNote = readCacheExpiry(input.TranscriptPath)
+	}
 	sessionDur := s.SessionDur
 	if sessionDur == 0 {
 		sessionDur = getSessionDuration()
@@ -509,7 +632,7 @@ func main() {
 	<-scopedDone
 	s.Usage.Scoped = scoped
 	if f, err := os.OpenFile(filepath.Join(os.TempDir(), "statusline-debug.log"), os.O_APPEND|os.O_WRONLY, 0644); err == nil {
-		fmt.Fprintf(f, "usage=%s scoped=%d\n", usageNote, len(scoped))
+		fmt.Fprintf(f, "usage=%s scoped=%d cache=%s hit=%d\n", usageNote, len(scoped), cacheNote, s.Cache.HitPct)
 		f.Close()
 	}
 
@@ -1015,6 +1138,13 @@ func renderLine3(s Statusline, cpuPct, memPct float64, sessionDur time.Duration,
 		})
 	}
 
+	// Prompt-Cache-Restwaerme (nur Claude Code, Copilot liefert kein Transcript)
+	if s.Flavor == FlavorClaude && termWidth >= 70 {
+		if el := renderCacheElement(s.Cache, termWidth >= 100); el != "" {
+			parts = append(parts, lineElement{el})
+		}
+	}
+
 	// Cost (Claude Code) bzw. API-Zeit (Copilot CLI kennt keine USD-Kosten)
 	if s.Flavor == FlavorCopilot {
 		if s.APIDuration > 0 {
@@ -1256,6 +1386,36 @@ func renderGitElement(data GitData, budget int) string {
 		strs[i] = p.str
 	}
 	return strings.Join(strs, sep)
+}
+
+// renderCacheElement zeigt, wie lange der Prompt-Cache der Konversation noch warm ist,
+// optional mit der Trefferquote des letzten API-Calls. Ohne bekannte TTL faellt es weg.
+func renderCacheElement(c CacheInfo, showHit bool) string {
+	if c.ExpiresAt.IsZero() {
+		return ""
+	}
+	rest := time.Until(c.ExpiresAt)
+	if rest <= 0 {
+		return IconCache + " " + Dim + "kalt" + Reset
+	}
+
+	label := fmt.Sprintf("%dm", int(rest/time.Minute))
+	if rest < time.Minute {
+		label = "<1m"
+	}
+	color := DarkGreen
+	switch {
+	case rest < 5*time.Minute:
+		color = BrightRed
+	case rest < 15*time.Minute:
+		color = Amber
+	}
+
+	out := fmt.Sprintf("%s %s%s%s", IconCache, color, label, Reset)
+	if showHit && c.HitPct >= 0 {
+		out += fmt.Sprintf(" %s%d%%%s", Dim, c.HitPct, Reset)
+	}
+	return out
 }
 
 // renderSystemElement rendert CPU oder RAM adaptiv

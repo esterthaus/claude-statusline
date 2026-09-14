@@ -36,7 +36,7 @@ maps it to the flavor-independent `Statusline` struct that all render functions 
 
 1. **Model + Context + Usage**: Model name, context window progress bar, then flavor-specific trailing elements — Claude Code: 5h/7d rate limits with reset times (`rate_limits`) plus one element per model-specific weekly limit (e.g. `Fable`, fetched from the OAuth usage endpoint, see below); Copilot: AIU consumption (`ai_used.formatted`) + session lines added/removed. Elements are dropped from the right as the terminal narrows (`termWidth/40` elements max: <80 → 1, <120 → 2, ≥120 → 3)
 2. **Workspace + Git + Worktree**: Shortened CWD, git status (changes, staged, stash, unpushed, unpulled), worktree name if active (Claude Code only)
-3. **System + Session + Cost**: CPU/RAM mini progress bars, session duration, then session cost in USD (Claude Code) or API time (Copilot, which has no USD cost)
+3. **System + Session + Cache + Cost**: CPU/RAM mini progress bars, session duration, prompt-cache warmth (Claude Code only, see below), then session cost in USD (Claude Code) or API time (Copilot, which has no USD cost)
 
 ### Data Sources
 
@@ -48,13 +48,37 @@ All model, context, 5h/7d rate limit, AIU, cost, and worktree data comes from th
 | gopsutil library | `getSystemStats()` | CPU (100ms sample) and RAM percentage |
 | Parent process | `getSessionDuration()` | Session duration from parent process creation time (Claude Code; Copilot uses `cost.total_duration_ms`) |
 | Anthropic OAuth usage endpoint | `fetchScopedLimits()` | Model-specific weekly limits (e.g. Fable). Claude Code flavor only, and only when stdin has `rate_limits` (subscription session). Runs in a goroutine parallel to git/sysstats |
+| Session transcript (`transcript_path`) | `readCacheExpiry()` | Prompt-cache TTL and time of the last API call. Claude Code flavor only |
+
+### Prompt Cache Warmth
+
+Line 3 shows how much longer the conversation's prompt cache stays warm (`🧊 47m 99%`). Neither number is in
+the stdin JSON as such — they are derived:
+
+- **Remaining warmth** comes from the session transcript, whose path stdin *does* carry as `transcript_path`
+  (undocumented in the struct before, along with `effort`, `session_name`, `fast_mode`, `thinking`, `workspace.repo`).
+  `readCacheExpiry()` reads the last 256 KB of the JSONL (`tailLines()`, discarding the truncated first line) and walks
+  it backwards. The time anchor is the newest `type == "assistant"` entry **with `isSidechain != true`** — subagents run
+  their own caches and must not move the anchor. Every cache hit refreshes the TTL, so `expiry = last turn + TTL`.
+- **The TTL** is read from the newest entry that actually wrote cache: `usage.cache_creation.ephemeral_1h_input_tokens > 0`
+  → 1 h, `ephemeral_5m_input_tokens > 0` → 5 min. Claude Code normally uses the 1 h TTL, but drops to 5 min in usage
+  overage — hence no hardcoded value. Without a determinable TTL the element is dropped rather than guessed.
+- **Hit rate** (`cacheHitPct()`) is the share of prompt tokens the last API call read from cache, computed from
+  `context_window.current_usage`. It falls off immediately after a compaction or an expired cache.
+- Colors: green > 15 min, amber 5–15 min, red < 5 min, dim `kalt` once expired. The hit rate is only rendered at
+  ≥ 100 columns, the whole element only at ≥ 70.
+- Caveat worth knowing: Claude Code renders the statusline on events only (there is no `refreshInterval` as in Copilot),
+  so during a long pause the countdown shows the value from the last turn rather than ticking down live.
+- `$TMPDIR/statusline-debug.log` records `cache=<1h|5m|no ttl|no path|err: …|skipped> hit=<pct>` per run.
 
 ### Usage Endpoint (model-specific weekly limits)
 
 Claude Code's `/usage` dialog shows a per-model weekly limit ("Current week (Fable)"), but the statusline stdin JSON
 does **not** carry it — `rate_limits` is built from the header-based in-memory state and only ever has `five_hour`
-and `seven_day` (verified against the 2.1.247 bundle; the statusline JSON has no other undocumented fields apart from
-`remote.session_id` in `--remote` mode). The dialog uses a different path, which this binary calls itself:
+and `seven_day` (verified against the 2.1.247 bundle). The JSON does carry other fields the struct ignores —
+`prompt_id`, `effort`, `session_name`, `output_style`, `fast_mode`, `thinking`, `workspace.repo`, and
+`remote.session_id` in `--remote` mode — but none of them is a rate limit; `transcript_path` is the one that is used
+(see prompt cache above). The dialog uses a different path, which this binary calls itself:
 
 - `GET https://api.anthropic.com/api/oauth/usage` with `Authorization: Bearer <accessToken>`,
   `Content-Type: application/json`, `anthropic-beta: oauth-2025-04-20`. **Undocumented API**, reverse-engineered from

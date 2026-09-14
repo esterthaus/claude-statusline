@@ -5,11 +5,11 @@ Statusline für **Claude Code** und **GitHub Copilot CLI**. Ein Go-Binary, liest
 ```
 Fable  •  🧠 Ctx: 64k/200k ██████░░░░░░░░░░░░░░ 32%  •  ⏱ 5h: ██████░░░░░░░░░ 42%  •  📅 7d: █░░░░░ 18%  •  📅 Fable: ░░░░░░ 12%
 📂 ~/projects/statusline  •  ⎇ Änd: 3 | Stg: 1 | ↑2 | ↓0
-💻 CPU: █░░░░░░ 12%  •  🎛 RAM: ███░░░░ 41%  •  ⏳ 1h 5m  •  💰 $2.31
+💻 CPU: █░░░░░░ 12%  •  🎛 RAM: ███░░░░ 41%  •  ⏳ 1h 5m  •  🧊 47m 99%  •  💰 $2.31
 ```
 
 Zeile 1: Modell, Context-Fenster, Rate Limits (5h / 7d / modellspezifisches Wochenlimit) bzw. AIU bei Copilot.
-Zeile 2: Verzeichnis, Git-Status. Zeile 3: CPU/RAM, Sitzungsdauer, Kosten. Passt sich der Terminalbreite an.
+Zeile 2: Verzeichnis, Git-Status. Zeile 3: CPU/RAM, Sitzungsdauer, Restwärme des Prompt-Caches (nur Claude Code), Kosten. Passt sich der Terminalbreite an.
 
 ## Installation
 
