@@ -647,9 +647,14 @@ func main() {
 }
 
 
-// formatDuration formatiert eine Dauer als "2h 30m"
+// formatDuration formatiert eine Dauer als "2h 30m", ab einem Tag als "2d 5h"
 func formatDuration(d time.Duration) string {
 	d = d.Round(time.Minute)
+	if d >= 24*time.Hour {
+		days := d / (24 * time.Hour)
+		d -= days * 24 * time.Hour
+		return fmt.Sprintf("%dd %dh", days, d/time.Hour)
+	}
 	h := d / time.Hour
 	d -= h * time.Hour
 	m := d / time.Minute
@@ -658,6 +663,20 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dh %dm", h, m)
 	}
 	return fmt.Sprintf("%dm", m)
+}
+
+// weekdayShort sind die deutschen Wochentagskürzel, indiziert über time.Weekday
+var weekdayShort = [7]string{"So", "Mo", "Di", "Mi", "Do", "Fr", "Sa"}
+
+// formatResetClock formatiert einen Reset-Zeitpunkt als Uhrzeit; liegt er mindestens
+// einen Tag in der Zukunft, kommt der Wochentag davor ("Do 09:59") — sonst wäre bei
+// Wochenlimits nicht erkennbar, welcher Tag gemeint ist.
+func formatResetClock(t time.Time) string {
+	local := t.Local()
+	if time.Until(t) >= 24*time.Hour {
+		return weekdayShort[local.Weekday()] + " " + local.Format("15:04")
+	}
+	return local.Format("15:04")
 }
 
 // shortenPath kürzt den Pfad (ersetzt Home mit ~)
@@ -690,6 +709,20 @@ func getColorForPercentage(percentage int) string {
 		return LightGreen
 	default:
 		return DarkGreen
+	}
+}
+
+// getColorForProjection gibt die Ampel-Farbe für eine Hochrechnung zurück. Eigene
+// Schwellen statt getColorForPercentage: eine Prognose von 60% heißt "hält locker",
+// während die normale Ampel dort schon amber wäre.
+func getColorForProjection(projected int) string {
+	switch {
+	case projected > 110:
+		return BrightRed
+	case projected > 90:
+		return Amber
+	default:
+		return LightGreen
 	}
 }
 
@@ -957,6 +990,39 @@ const sepVisibleWidth = 5 // sichtbare Breite von "  •  "
 // trailingElement rendert ein Element rechts der Context-Anzeige
 type trailingElement func(budget int, showBars bool) string
 
+// Fensterlängen der Rate Limits — aus resets_at minus Fensterlänge ergibt sich der Fensterstart
+const (
+	fiveHourWindow = 5 * time.Hour
+	weeklyWindow   = 7 * 24 * time.Hour
+)
+
+// minElapsedFraction ist der Anteil des Fensters, der verstrichen sein muss, bevor eine
+// Hochrechnung gezeigt wird. Davor wird der Schnitt von einem einzelnen Burst dominiert
+// und die Prognose explodiert.
+const minElapsedFraction = 0.05
+
+// projectUsage rechnet den bisherigen Durchschnittsverbrauch des Fensters auf das
+// Fensterende hoch: verbraucht% geteilt durch den verstrichenen Fensteranteil.
+// -1 = keine belastbare Prognose (kein Reset bekannt, Reset vorbei, Fenster zu frisch).
+func projectUsage(pct int, resetTs int64, window time.Duration) int {
+	if pct < 0 || resetTs <= 0 || window <= 0 {
+		return -1
+	}
+	remaining := time.Until(time.Unix(resetTs, 0))
+	if remaining <= 0 || remaining > window {
+		return -1
+	}
+	elapsed := float64(window-remaining) / float64(window)
+	if elapsed < minElapsedFraction {
+		return -1
+	}
+	projected := int(float64(pct)/elapsed + 0.5)
+	if projected > 999 {
+		projected = 999
+	}
+	return projected
+}
+
 // line1Trailing liefert die flavor-spezifischen Elemente rechts der Context-Anzeige, in Anzeigereihenfolge.
 // Claude Code: 5h, 7d, dann modellspezifische Wochenlimits (z.B. Fable). Copilot CLI: AIU-Verbrauch + geänderte Zeilen.
 func line1Trailing(s Statusline) []trailingElement {
@@ -970,16 +1036,19 @@ func line1Trailing(s Statusline) []trailingElement {
 	}
 
 	elems = append(elems, func(budget int, showBars bool) string {
-		return renderRateLimitElement(s.Usage.FiveHourUtil, s.Usage.FiveHourReset, "5h", IconClock, budget, showBars, BrightMagenta)
+		projected := projectUsage(s.Usage.FiveHourUtil, s.Usage.FiveHourReset, fiveHourWindow)
+		return renderRateLimitElement(s.Usage.FiveHourUtil, s.Usage.FiveHourReset, projected, "5h", IconClock, budget, showBars, BrightMagenta)
 	})
 	if s.Usage.SevenDayUtil >= 0 {
 		elems = append(elems, func(budget int, showBars bool) string {
-			return renderRateLimitElement(s.Usage.SevenDayUtil, s.Usage.SevenDayReset, "7d", IconCalendar, budget, showBars, BrightYellow)
+			projected := projectUsage(s.Usage.SevenDayUtil, s.Usage.SevenDayReset, weeklyWindow)
+			return renderRateLimitElement(s.Usage.SevenDayUtil, s.Usage.SevenDayReset, projected, "7d", IconCalendar, budget, showBars, BrightYellow)
 		})
 	}
 	for _, sl := range s.Usage.Scoped {
 		elems = append(elems, func(budget int, showBars bool) string {
-			return renderRateLimitElement(sl.Util, sl.Reset, sl.Name, IconCalendar, budget, showBars, Cyan)
+			projected := projectUsage(sl.Util, sl.Reset, weeklyWindow)
+			return renderRateLimitElement(sl.Util, sl.Reset, projected, sl.Name, IconCalendar, budget, showBars, Cyan)
 		})
 	}
 	return elems
@@ -1223,7 +1292,7 @@ func renderContextElement(current, max, budget int, showBars bool) string {
 }
 
 // renderRateLimitElement rendert ein Rate-Limit-Element adaptiv
-func renderRateLimitElement(pct int, resetTs int64, label, icon string, budget int, showBars bool, labelColor string) string {
+func renderRateLimitElement(pct int, resetTs int64, projected int, label, icon string, budget int, showBars bool, labelColor string) string {
 	if pct < 0 {
 		return Dim + icon + " " + label + ": N/A" + Reset
 	}
@@ -1231,8 +1300,10 @@ func renderRateLimitElement(pct int, resetTs int64, label, icon string, budget i
 	color := getColorForPercentage(pct)
 
 	if showBars && budget >= 20 {
-		// Bar + optional Reset-Zeit: ⏱(2) + " 5h:"(4) + " "(1) + bar + " "(1) + pct(~3) ≈ 11 + barWidth
-		barWidth := budget - 14
+		// Bar + optionaler Zusatz: ⏱(2) + " 5h:"(4) + " "(1) + bar + " "(1) + pct(~3) ≈ 11 + barWidth.
+		// Der Platz für die Hochrechnung wird der Bar vorweg abgezogen — sonst frisst sie
+		// das ganze Budget und die Prognose fällt gerade bei den schmalen Elementen weg.
+		barWidth := budget - 14 - projectionWidth(projected)
 		if barWidth < 3 {
 			barWidth = 3
 		}
@@ -1240,24 +1311,7 @@ func renderRateLimitElement(pct int, resetTs int64, label, icon string, budget i
 			barWidth = 15
 		}
 		result := renderProgressBar(pct, 100, icon+" "+label, barWidth, labelColor)
-		// Reset-Zeit anhängen wenn Platz
-		if resetTs > 0 {
-			resetTime := time.Unix(resetTs, 0)
-			timeUntil := time.Until(resetTime)
-			if timeUntil > 0 {
-				resetStr := fmt.Sprintf(" %sin %s (%s)%s", Dim, formatDuration(timeUntil), resetTime.Local().Format("15:04"), Reset)
-				if visibleWidth(result)+visibleWidth(resetStr) <= budget {
-					result += resetStr
-				} else {
-					// Nur Uhrzeit wenn Platz
-					shortReset := fmt.Sprintf(" %s%s%s", Dim, resetTime.Local().Format("15:04"), Reset)
-					if visibleWidth(result)+visibleWidth(shortReset) <= budget {
-						result += shortReset
-					}
-				}
-			}
-		}
-		return result
+		return result + fitSuffix(result, resetTs, projected, budget)
 	}
 
 	if budget >= 10 {
@@ -1266,14 +1320,7 @@ func renderRateLimitElement(pct int, resetTs int64, label, icon string, budget i
 			labelColor, icon, label, Reset,
 			color, pct, Reset,
 		)
-		if resetTs > 0 {
-			resetTime := time.Unix(resetTs, 0)
-			timeStr := fmt.Sprintf(" %s%s%s", Dim, resetTime.Local().Format("15:04"), Reset)
-			if visibleWidth(result)+visibleWidth(timeStr) <= budget {
-				result += timeStr
-			}
-		}
-		return result
+		return result + fitSuffix(result, resetTs, projected, budget)
 	}
 
 	// Minimal: "⏱ 5h: 45%"
@@ -1281,6 +1328,46 @@ func renderRateLimitElement(pct int, resetTs int64, label, icon string, budget i
 		labelColor, icon, label, Reset,
 		color, pct, Reset,
 	)
+}
+
+// renderProjection rendert die Hochrechnung als " →74%"
+func renderProjection(projected int) string {
+	return fmt.Sprintf(" %s→%d%%%s", getColorForProjection(projected), projected, Reset)
+}
+
+// projectionWidth ist die sichtbare Breite der Hochrechnung, 0 wenn es keine gibt
+func projectionWidth(projected int) int {
+	if projected < 0 {
+		return 0
+	}
+	return visibleWidth(renderProjection(projected))
+}
+
+// fitSuffix wählt den ausführlichsten Zusatz (Reset-Zeit + Hochrechnung), der hinter
+// result noch ins Budget passt. Fehlende Bausteine sind leere Strings, die Liste
+// degradiert dadurch von selbst korrekt.
+func fitSuffix(result string, resetTs int64, projected, budget int) string {
+	var long, short, proj string
+	if resetTs > 0 {
+		resetTime := time.Unix(resetTs, 0)
+		if timeUntil := time.Until(resetTime); timeUntil > 0 {
+			clock := formatResetClock(resetTime)
+			long = fmt.Sprintf(" %sin %s (%s)%s", Dim, formatDuration(timeUntil), clock, Reset)
+			short = fmt.Sprintf(" %s%s%s", Dim, clock, Reset)
+		}
+	}
+	if projected >= 0 {
+		proj = renderProjection(projected)
+	}
+
+	// Absteigend nach Ausführlichkeit: die Hochrechnung überlebt länger als die Reset-Zeit
+	used := visibleWidth(result)
+	for _, candidate := range []string{long + proj, short + proj, proj, long, short} {
+		if used+visibleWidth(candidate) <= budget {
+			return candidate
+		}
+	}
+	return ""
 }
 
 // renderAIUElement rendert den AIU-Verbrauch (Copilot CLI)
